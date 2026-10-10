@@ -9,9 +9,15 @@ let currentMode = 'NAVIGATION';
 let audioBufferChunk = [];
 let silenceFrames = 0;
 
-// Tuned for earphone microphones
+// Holds latest normalized nose coordinates streamed from tracker.js
+let latestCursor = { x: 0.5, y: 0.5 };
+
+// Active tab cache to eliminate tabs.query IPC lag
+let activeTabId = null;
+
+// VAD parameters tuned for earphone microphones
 const SILENCE_RMS_THRESHOLD = 0.004;
-const MIN_SPEECH_ZCR = 0.04; // Wind typically stays below 0.02; human voice is > 0.05
+const MIN_SPEECH_ZCR = 0.04;
 const SILENCE_FRAMES_TO_TRIGGER = 3; // ~0.8s pause triggers inference
 
 const COMMANDS = {
@@ -24,7 +30,46 @@ const COMMANDS = {
   'clear': { action: 'CLEAR' }
 };
 
-// 1. Initialize Speech Recognizer
+// 1. Maintain Active Web Tab Cache Safely
+async function updateActiveTab() {
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    let target = tabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
+
+    if (!target) {
+      const allTabs = await browser.tabs.query({ active: true });
+      target = allTabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
+    }
+
+    if (target?.id) {
+      activeTabId = target.id;
+    }
+  } catch (e) {
+    // Fail silently during browser tab transitions
+  }
+}
+
+browser.tabs.onActivated.addListener(() => { updateActiveTab(); });
+browser.tabs.onUpdated.addListener(() => { updateActiveTab(); });
+updateActiveTab();
+
+// Non-blocking fire-and-forget message dispatcher
+function sendToTab(msg) {
+  if (activeTabId) {
+    browser.tabs.sendMessage(activeTabId, msg).catch(() => {
+      activeTabId = null;
+      updateActiveTab();
+    });
+  } else {
+    updateActiveTab().then(() => {
+      if (activeTabId) {
+        browser.tabs.sendMessage(activeTabId, msg).catch(() => {});
+      }
+    });
+  }
+}
+
+// 2. Initialize Whisper Speech Recognizer
 async function initEngine() {
   console.log('[Handsfree] Initializing local speech model...');
   try {
@@ -33,14 +78,33 @@ async function initEngine() {
     });
     console.log('[Handsfree] Local speech recognizer ready.');
   } catch (err) {
-    console.error('[Handsfree] Failed to load model:', err);
+    console.error('[Handsfree] Speech engine init error:', err);
   }
 }
 
 initEngine();
 
-// 2. Audio Ingestion via persistent Port from mic-permission tab
+// 3. Port Connections (Audio & Tracker Streams)
 browser.runtime.onConnect.addListener((port) => {
+  // --- High-Speed Nose Tracking Stream ---
+  if (port.name === 'cursor-tracking') {
+    console.log('[Handsfree] Cursor tracking port connected.');
+
+    port.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'CURSOR_MOVE') {
+        latestCursor.x = msg.x;
+        latestCursor.y = msg.y;
+
+        sendToTab({
+          type: 'UPDATE_CURSOR',
+          x: msg.x,
+          y: msg.y
+        });
+      }
+    });
+  }
+
+  // --- Audio Stream from mic-permission tab ---
   if (port.name === 'audio-stream') {
     console.log('[Handsfree] Audio stream port connected.');
 
@@ -51,7 +115,6 @@ browser.runtime.onConnect.addListener((port) => {
       const rms = calculateRMS(chunk);
       const zcr = calculateZCR(chunk);
 
-      // A chunk is only treated as speech if it has both energy AND voice-like frequency
       const isSpeech = (rms >= SILENCE_RMS_THRESHOLD) && (zcr >= MIN_SPEECH_ZCR);
 
       if (isSpeech) {
@@ -66,24 +129,23 @@ browser.runtime.onConnect.addListener((port) => {
           audioBufferChunk = [];
           silenceFrames = 0;
 
-          // Discard short bursts or mic clicks (< 0.4s)
+          // Drop noise bursts shorter than 0.4 seconds
           if (fullBuffer.length < 16000 * 0.4) return;
 
           console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
-          
+
           try {
             const output = await transcriber(fullBuffer);
             let transcript = '';
             if (typeof output === 'string') transcript = output;
             else if (Array.isArray(output) && output[0]?.text) transcript = output[0].text;
             else if (output?.text) transcript = output.text;
-            
+
             transcript = transcript.trim();
             console.log(`[Raw Model Output]: "${transcript}"`);
-            
+
             if (!transcript) return;
 
-            // Route recognized text to commands or dictation
             if (currentMode === 'NAVIGATION') {
               const lower = transcript.toLowerCase();
               let matched = false;
@@ -91,7 +153,12 @@ browser.runtime.onConnect.addListener((port) => {
               for (const [cmd, config] of Object.entries(COMMANDS)) {
                 if (lower.includes(cmd)) {
                   console.log(`[Handsfree Command Triggered]: ${cmd}`);
-                  await dispatchToActiveTab({ type: 'COMMAND', command: config.action, payload: config.payload });
+
+                  const payload = (cmd === 'click')
+                    ? { x: latestCursor.x, y: latestCursor.y }
+                    : config.payload;
+
+                  sendToTab({ type: 'COMMAND', command: config.action, payload });
                   matched = true;
                   break;
                 }
@@ -101,23 +168,22 @@ browser.runtime.onConnect.addListener((port) => {
                 console.log(`[Handsfree] No navigation command matched in: "${lower}"`);
               }
             } else if (currentMode === 'DICTATION') {
-              // Strip punctuation and surrounding spaces
               const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
               if (cleanText.includes('stop dictating') || cleanText.includes('escape')) {
                 currentMode = 'NAVIGATION';
-                await dispatchToActiveTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
+                sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
-                cleanText === 'clear' || 
-                cleanText === 'clear field' || 
-                cleanText === 'clear text' || 
+                cleanText === 'clear' ||
+                cleanText === 'clear field' ||
+                cleanText === 'clear text' ||
                 cleanText === 'delete all' ||
                 cleanText.endsWith(' clear')
               ) {
                 console.log(`[Handsfree] Intercepted CLEAR command from utterance: "${transcript}"`);
-                await dispatchToActiveTab({ type: 'COMMAND', command: 'CLEAR' });
+                sendToTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
-                await dispatchToActiveTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
+                sendToTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
               }
             }
           } catch (err) {
@@ -132,9 +198,7 @@ browser.runtime.onConnect.addListener((port) => {
 // Audio math helpers
 function calculateRMS(buffer) {
   let sum = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    sum += buffer[i] * buffer[i];
-  }
+  for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
   return Math.sqrt(sum / buffer.length);
 }
 
@@ -159,26 +223,7 @@ function mergeAudioBuffers(buffers) {
   return result;
 }
 
-// Tab message dispatcher (robust against DevTools / background window focus)
-async function dispatchToActiveTab(message) {
-  try {
-    const tabs = await browser.tabs.query({ active: true });
-    // Pick the visible website tab (ignoring about:* and moz-extension://)
-    const targetTab = tabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
-
-    if (!targetTab?.id) {
-      console.warn('[Handsfree] No active http/https tab found to receive action.');
-      return;
-    }
-
-    console.log(`[Handsfree] Dispatching ${message.type} to tab ${targetTab.id}`);
-    await browser.tabs.sendMessage(targetTab.id, message);
-  } catch (err) {
-    console.error('[Handsfree] Dispatch failed (refresh the webpage if extension was just reloaded):', err.message);
-  }
-}
-
-// Listen for mode changes triggered by content.js DOM focus
+// Listen for mode changes triggered by DOM focus in content.js
 browser.runtime.onMessage.addListener((message) => {
   if (message.type === 'SET_MODE') {
     currentMode = message.mode;
