@@ -15,8 +15,8 @@ const MIN_SPEECH_ZCR = 0.04; // Wind typically stays below 0.02; human voice is 
 const SILENCE_FRAMES_TO_TRIGGER = 3; // ~0.8s pause triggers inference
 
 const COMMANDS = {
-  'scroll down': { action: 'SCROLL', payload: { y: 450 } },
-  'scroll up': { action: 'SCROLL', payload: { y: -450 } },
+  'scroll down': { action: 'SCROLL', payload: { y: 600 } },
+  'scroll up': { action: 'SCROLL', payload: { y: -600 } },
   'down': { action: 'SCROLL', payload: { y: 350 } },
   'up': { action: 'SCROLL', payload: { y: -350 } },
   'click': { action: 'CLICK' },
