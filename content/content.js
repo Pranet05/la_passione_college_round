@@ -73,11 +73,9 @@ document.addEventListener('focusout', (e) => {
 // --- 3. Message Listener ---
 browser.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'UPDATE_CURSOR') {
-    // Translate normalized coordinates to screen pixel values
     currentScreenX = msg.x * window.innerWidth;
     currentScreenY = msg.y * window.innerHeight;
 
-    // Use GPU transform to avoid layout thrashing
     if (cursorEl) {
       cursorEl.style.transform = `translate3d(${currentScreenX - 10}px, ${currentScreenY - 10}px, 0)`;
     }
@@ -87,7 +85,10 @@ browser.runtime.onMessage.addListener((msg) => {
     injectTextIntoActiveElement(msg.text);
   } else if (msg.type === 'MODE_CHANGE') {
     if (msg.mode === 'NAVIGATION') {
-      document.activeElement?.blur();
+      // Unfocus input to break out of text fields
+      if (document.activeElement && typeof document.activeElement.blur === 'function') {
+        document.activeElement.blur();
+      }
     }
   }
 });
@@ -99,30 +100,55 @@ function handleNavigationCommand(command, payload) {
       window.scrollBy({ top: payload.y, behavior: 'smooth' });
       break;
 
+    case 'SUBMIT_SEARCH': {
+      const el = document.activeElement;
+      if (!el) return;
+
+      console.log('[Handsfree] Submitting search / pressing Enter on:', el);
+
+      // 1. Dispatch authentic KeyboardEvent sequence for Enter (key code 13)
+      const enterOptions = {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+        view: window
+      };
+
+      el.dispatchEvent(new KeyboardEvent('keydown', enterOptions));
+      el.dispatchEvent(new KeyboardEvent('keypress', enterOptions));
+      el.dispatchEvent(new KeyboardEvent('keyup', enterOptions));
+
+      // 2. Fallback: if the input belongs to a <form>, submit it directly
+      if (el.form && typeof el.form.requestSubmit === 'function') {
+        el.form.requestSubmit();
+      } else if (el.form && typeof el.form.submit === 'function') {
+        el.form.submit();
+      }
+
+      // 3. Blur the element to drop cursor focus
+      el.blur();
+      break;
+    }
+
     case 'CLICK': {
       const clickX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const clickY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
 
-      // Find element located directly at the pointer point
       if (cursorEl) cursorEl.style.display = 'none';
       let target = document.elementFromPoint(clickX, clickY);
       if (cursorEl) cursorEl.style.display = 'block';
 
-      // Fallback to hovered or focused element if clicking off-screen/blank area
       if (!target || target === document.body || target === document.documentElement) {
         target = (lastHoveredElement && lastHoveredElement !== document.body)
           ? lastHoveredElement
           : (document.activeElement !== document.body ? document.activeElement : null);
       }
 
-      if (!target) {
-        console.warn('[Handsfree] No clickable target at coordinates:', clickX, clickY);
-        return;
-      }
+      if (!target) return;
 
-      console.log('[Handsfree] Clicking target:', target);
-
-      // Visual pulse feedback on the red pointer
       if (cursorEl) {
         cursorEl.style.transform = `translate3d(${clickX - 10}px, ${clickY - 10}px, 0) scale(1.6)`;
         setTimeout(() => {
@@ -136,7 +162,6 @@ function handleNavigationCommand(command, payload) {
         target.focus();
       }
 
-      // Dispatch full mouse event cycle
       const mouseInit = {
         bubbles: true,
         cancelable: true,
@@ -168,14 +193,8 @@ function handleNavigationCommand(command, payload) {
 
     case 'CLEAR': {
       const el = document.activeElement;
-      if (!el || !isTextInput(el)) {
-        console.warn('[Handsfree] Cannot clear: no text input focused.');
-        return;
-      }
+      if (!el || !isTextInput(el)) return;
 
-      console.log('[Handsfree] Clearing focused field:', el);
-
-      // 1. ContentEditable elements
       if (el.isContentEditable) {
         document.execCommand('selectAll', false, null);
         document.execCommand('delete', false, null);
@@ -184,12 +203,10 @@ function handleNavigationCommand(command, payload) {
         return;
       }
 
-      // 2. Standard Inputs & Textareas
       el.focus();
       if (typeof el.select === 'function') el.select();
       const deleted = document.execCommand('delete', false, null);
 
-      // 3. React / Vue synthetic value setter bypass
       if (!deleted || el.value !== '') {
         const nativeSetter = Object.getOwnPropertyDescriptor(
           window.HTMLInputElement.prototype, 'value'

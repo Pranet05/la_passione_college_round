@@ -174,6 +174,18 @@ browser.runtime.onConnect.addListener((port) => {
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
+                cleanText === 'search' ||
+                cleanText === 'enter' ||
+                cleanText === 'submit' ||
+                cleanText.endsWith(' search')
+              ) {
+                console.log(`[Handsfree] Intercepted SEARCH / SUBMIT command from: "${transcript}"`);
+                // 1. Submit search form / press Enter
+                sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
+                // 2. Return back to NAVIGATION mode
+                currentMode = 'NAVIGATION';
+                sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
+              } else if (
                 cleanText === 'clear' ||
                 cleanText === 'clear field' ||
                 cleanText === 'clear text' ||
