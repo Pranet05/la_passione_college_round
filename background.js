@@ -101,14 +101,20 @@ browser.runtime.onConnect.addListener((port) => {
                 console.log(`[Handsfree] No navigation command matched in: "${lower}"`);
               }
             } else if (currentMode === 'DICTATION') {
-              const lower = transcript.toLowerCase();
+              // Strip punctuation and surrounding spaces
+              const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
-              if (lower.includes('stop dictating') || lower.includes('escape')) {
+              if (cleanText.includes('stop dictating') || cleanText.includes('escape')) {
                 currentMode = 'NAVIGATION';
                 await dispatchToActiveTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
-              } else if (lower === 'clear' || lower === 'clear field' || lower === 'delete all') {
-                // Intercept 'clear' command while inside a text field
-                console.log('[Handsfree] Clear field triggered inside dictation mode.');
+              } else if (
+                cleanText === 'clear' || 
+                cleanText === 'clear field' || 
+                cleanText === 'clear text' || 
+                cleanText === 'delete all' ||
+                cleanText.endsWith(' clear')
+              ) {
+                console.log(`[Handsfree] Intercepted CLEAR command from utterance: "${transcript}"`);
                 await dispatchToActiveTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
                 await dispatchToActiveTab({ type: 'INJECT_TEXT', text: transcript + ' ' });

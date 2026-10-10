@@ -90,31 +90,53 @@ function handleNavigationCommand(command, payload) {
 
     case 'CLEAR': {
       const el = document.activeElement;
-      if (!el || !isTextInput(el)) return;
+      if (!el || !isTextInput(el)) {
+        console.warn('[Handsfree] Cannot clear: no text input actively focused.');
+        return;
+      }
 
+      console.log('[Handsfree] Clearing focused field:', el);
+
+      // Method 1: ContentEditable elements (e.g. Rich Text Editors, Docs)
       if (el.isContentEditable) {
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
         el.innerText = '';
         el.dispatchEvent(new Event('input', { bubbles: true }));
         return;
       }
 
-      // Bypass React/Vue synthetic value overrides
-      const nativeSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype,
-        'value'
-      )?.set || Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        'value'
-      )?.set;
-
-      if (nativeSetter) {
-        nativeSetter.call(el, '');
-      } else {
-        el.value = '';
+      // Method 2: Standard Inputs & Textareas
+      el.focus();
+      
+      // Select all text first so delete commands wipe everything
+      if (typeof el.select === 'function') {
+        el.select();
       }
 
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
+      // Execute browser-native delete
+      const deleted = document.execCommand('delete', false, null);
+
+      // Method 3: Direct prototype reset for React/Vue if execCommand was blocked
+      if (!deleted || el.value !== '') {
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype,
+          'value'
+        )?.set || Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype,
+          'value'
+        )?.set;
+
+        if (nativeSetter) {
+          nativeSetter.call(el, '');
+        } else {
+          el.value = '';
+        }
+
+        // Dispatch full input sequence so UI frameworks detect the change
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
       break;
     }
   }
