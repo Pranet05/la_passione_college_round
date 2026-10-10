@@ -1,9 +1,12 @@
-// content.js - DOM Execution and Input Focus Tracking
+// content.js - DOM Execution & Event Dispatching
 
-// Add to the top of content.js
-console.log('[Handsfree Content Script] Injected and active on:', window.location.href);
+let lastHoveredElement = null;
 
-// 1. Automatic Dictation vs. Navigation Mode Switching
+// Track whatever element the cursor is currently resting over
+document.addEventListener('mousemove', (e) => {
+  lastHoveredElement = e.target;
+}, { passive: true });
+
 function isTextInput(el) {
   if (!el) return false;
   const tag = el.tagName?.toLowerCase();
@@ -14,6 +17,7 @@ function isTextInput(el) {
   );
 }
 
+// Track input focus for automatic mode switching
 document.addEventListener('focusin', (e) => {
   if (isTextInput(e.target)) {
     browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'DICTATION' });
@@ -26,21 +30,16 @@ document.addEventListener('focusout', (e) => {
   }
 });
 
-// In the browser.runtime.onMessage listener in content.js, update to send an acknowledgment:
+// Listener
 browser.runtime.onMessage.addListener((msg) => {
-  console.log('[Handsfree Content Script] Received message:', msg);
-
   if (msg.type === 'COMMAND') {
     handleNavigationCommand(msg.command, msg.payload);
-    return Promise.resolve({ status: 'command_executed', command: msg.command });
   } else if (msg.type === 'INJECT_TEXT') {
     injectTextIntoActiveElement(msg.text);
-    return Promise.resolve({ status: 'text_injected' });
   } else if (msg.type === 'MODE_CHANGE') {
     if (msg.mode === 'NAVIGATION') {
       document.activeElement?.blur();
     }
-    return Promise.resolve({ status: 'mode_changed' });
   }
 });
 
@@ -50,24 +49,74 @@ function handleNavigationCommand(command, payload) {
       window.scrollBy({ top: payload.y, behavior: 'smooth' });
       break;
 
-    case 'CLICK':
-      if (document.activeElement) {
-        document.activeElement.click();
+    case 'CLICK': {
+      // 1. Prioritize element under cursor/hover; fallback to focused element
+      const target = (lastHoveredElement && lastHoveredElement !== document.body) 
+        ? lastHoveredElement 
+        : (document.activeElement !== document.body ? document.activeElement : null);
+
+      if (!target) {
+        console.warn('[Handsfree] No specific element hovered or focused to click.');
+        return;
+      }
+
+      console.log('[Handsfree] Clicking element:', target);
+
+      // Dispatch full mouse event lifecycle
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtType => {
+        target.dispatchEvent(new MouseEvent(evtType, {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      });
+
+      if (typeof target.click === 'function') {
+        target.click();
       }
       break;
+    }
 
-    case 'FOCUS_SEARCH':
-      const searchBox = document.querySelector('input[type="search"], input[name="q"], input[title*="Search" i], input[type="text"]');
+    case 'FOCUS_SEARCH': {
+      const searchBox = document.querySelector(
+        'input[type="search"], input[name="q"], input[name="search"], input[title*="Search" i], [role="searchbox"]'
+      );
       if (searchBox) {
         searchBox.focus();
+        searchBox.select();
       }
       break;
+    }
 
-    case 'CLEAR':
-      if (isTextInput(document.activeElement)) {
-        document.activeElement.value = '';
+    case 'CLEAR': {
+      const el = document.activeElement;
+      if (!el || !isTextInput(el)) return;
+
+      if (el.isContentEditable) {
+        el.innerText = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
       }
+
+      // Bypass React/Vue synthetic value overrides
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value'
+      )?.set || Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        'value'
+      )?.set;
+
+      if (nativeSetter) {
+        nativeSetter.call(el, '');
+      } else {
+        el.value = '';
+      }
+
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
       break;
+    }
   }
 }
 
@@ -75,10 +124,8 @@ function injectTextIntoActiveElement(text) {
   const el = document.activeElement;
   if (!el || !isTextInput(el)) return;
 
-  // Use execCommand to preserve browser Undo/Redo history and dispatch input events
   const success = document.execCommand('insertText', false, text);
   if (!success && typeof el.value !== 'undefined') {
-    // Fallback if execCommand is restricted
     const start = el.selectionStart || 0;
     const end = el.selectionEnd || 0;
     el.value = el.value.substring(0, start) + text + el.value.substring(end);

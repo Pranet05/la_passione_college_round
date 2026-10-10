@@ -102,9 +102,14 @@ browser.runtime.onConnect.addListener((port) => {
               }
             } else if (currentMode === 'DICTATION') {
               const lower = transcript.toLowerCase();
+
               if (lower.includes('stop dictating') || lower.includes('escape')) {
                 currentMode = 'NAVIGATION';
                 await dispatchToActiveTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
+              } else if (lower === 'clear' || lower === 'clear field' || lower === 'delete all') {
+                // Intercept 'clear' command while inside a text field
+                console.log('[Handsfree] Clear field triggered inside dictation mode.');
+                await dispatchToActiveTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
                 await dispatchToActiveTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
               }
