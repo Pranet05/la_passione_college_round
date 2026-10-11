@@ -543,6 +543,21 @@ browser.runtime.onConnect.addListener((port) => {
                 .trim();
 
               console.log(`[Handsfree Cleaned Utterance]: "${lower}"`);
+              const lower = transcript.toLowerCase();
+              const linkNumber = parseLinkNumber(lower);
+
+              // Link hints are handled before the normal command table so
+              // utterances such as "click three" can still select hint 3.
+              if (linkNumber !== null) {
+                console.log(`[Handsfree] Link hint selected: ${linkNumber}`);
+                sendToTab({
+                  type: 'COMMAND',
+                  command: 'LINK_NUMBER',
+                  payload: { number: linkNumber }
+                });
+                return;
+              }
+
               let matched = false;
 
               for (const cmd of SORTED_COMMAND_KEYS) {

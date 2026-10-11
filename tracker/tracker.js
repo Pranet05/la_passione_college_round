@@ -67,6 +67,12 @@ let smoothX = 0.5;
 let smoothY = 0.5;
 let lastRawNoseX = 0.5;
 let lastRawNoseY = 0.5;
+let filteredNoseX = null;
+let filteredNoseY = null;
+
+// Face landmarks drift by a few pixels even while the user is still. Ignore
+// that noise after projection so the pointer can rest on a target.
+const CURSOR_DEAD_ZONE = 0.006;
 
 let lastSend = 0;
 const SEND_INTERVAL = 16; // ~60 FPS
@@ -357,8 +363,21 @@ function startProcessingLoop() {
 
           const rawX = 1.0 - nose.x;
           const rawY = nose.y;
-          lastRawNoseX = rawX;
-          lastRawNoseY = rawY;
+
+          if (filteredNoseX === null || filteredNoseY === null) {
+            filteredNoseX = rawX;
+            filteredNoseY = rawY;
+          } else {
+            // Filter landmark noise at rest and respond faster when the head
+            // moves a meaningful distance.
+            const rawDistance = Math.hypot(rawX - filteredNoseX, rawY - filteredNoseY);
+            const landmarkFactor = Math.min(0.58, 0.18 + rawDistance * 7);
+            filteredNoseX += (rawX - filteredNoseX) * landmarkFactor;
+            filteredNoseY += (rawY - filteredNoseY) * landmarkFactor;
+          }
+
+          lastRawNoseX = filteredNoseX;
+          lastRawNoseY = filteredNoseY;
 
           if (calibratedOriginX === null || calibratedOriginY === null) {
             frameCounter++;
@@ -381,8 +400,21 @@ function startProcessingLoop() {
             targetY = 0.5 + (rawY - originY) * sensitivityY;
           }
 
+          const originX = calibratedOriginX ?? 0.5;
+          const originY = calibratedOriginY ?? 0.5;
+
+          // Project around calibrated neutral head posture
+          let targetX = 0.5 + (filteredNoseX - originX) * sensitivityX;
+          let targetY = 0.5 + (filteredNoseY - originY) * sensitivityY;
+
+          // Suppress sub-pixel camera wobble before it reaches the cursor.
+          if (Math.abs(targetX - smoothX) < CURSOR_DEAD_ZONE) targetX = smoothX;
+          if (Math.abs(targetY - smoothY) < CURSOR_DEAD_ZONE) targetY = smoothY;
+
+          // Damp small movements while allowing deliberate movement to catch up.
           const deltaDist = Math.hypot(targetX - smoothX, targetY - smoothY);
-          const dynamicFactor = Math.min(0.85, smoothFactor + deltaDist * 2.5);
+          const baseFactor = 0.08 + smoothFactor * 0.28;
+          const dynamicFactor = Math.min(0.62, baseFactor + deltaDist * 2.2);
 
           smoothX += (targetX - smoothX) * dynamicFactor;
           smoothY += (targetY - smoothY) * dynamicFactor;
