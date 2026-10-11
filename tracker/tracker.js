@@ -156,8 +156,8 @@ async function initAudio(stream) {
     highPass.type = 'highpass';
     highPass.frequency.setValueAtTime(120, audioContext.currentTime);
 
-    // ScriptProcessor for 2048-sample audio chunking (~128ms per chunk)
-    const processor = audioContext.createScriptProcessor(2048, 1, 1);
+    // Smaller chunks reduce the time between the end of speech and command dispatch.
+    const processor = audioContext.createScriptProcessor(1024, 1, 1);
 
     processor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);

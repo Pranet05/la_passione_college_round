@@ -23,7 +23,7 @@ let speechActivityTimeout = null;
 // High-speed VAD parameters: ~250ms pause triggers inference
 const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
-const SILENCE_FRAMES_TO_TRIGGER = 2;
+const SILENCE_FRAMES_TO_TRIGGER = 1;
 
 // How long after last speech frame before we consider speech ended (if no command fires)
 const SPEECH_COOLDOWN_MS = 600;
@@ -74,6 +74,7 @@ const COMMANDS = {
   // Input reset
   'clear': { action: 'CLEAR' },
 
+<<<<<<< Updated upstream
   // Browser navigation
   'go back': { action: 'GO_BACK' },
   'back': { action: 'GO_BACK' },
@@ -100,7 +101,42 @@ const COMMANDS = {
   'zoom in': { action: 'ZOOM_IN' },
   'zoom out': { action: 'ZOOM_OUT' },
   'reset zoom': { action: 'ZOOM_RESET' },
+=======
+  // Page-level controls
+  'close current tab': { action: 'CLOSE_TAB' },
+  'close tab': { action: 'CLOSE_TAB' },
+  'show links': { action: 'SHOW_CLICKABLES' },
+  'show clickables': { action: 'SHOW_CLICKABLES' },
+  'show link numbers': { action: 'SHOW_CLICKABLES' },
+  'hide links': { action: 'HIDE_CLICKABLES' }
+>>>>>>> Stashed changes
 };
+
+const COMMAND_ENTRIES = Object.entries(COMMANDS).sort(([left], [right]) => right.length - left.length);
+
+function normalizeTranscript(transcript) {
+  return transcript
+    .toLowerCase()
+    .replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getNumberFromTranscript(text) {
+  const numberWords = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+    six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+    sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20
+  };
+  const numericMatch = text.match(/\b(?:click|select|press|choose|open)\s+(\d{1,3})\b/);
+  if (numericMatch) return Number(numericMatch[1]);
+
+  const wordMatch = text.match(/\b(?:click|select|press|choose|open)\s+([a-z]+)\b/);
+  return wordMatch && numberWords[wordMatch[1]] !== undefined
+    ? numberWords[wordMatch[1]]
+    : null;
+}
 
 // 1. Maintain Active Web Tab Target Synchronously
 // CRITICAL: Always prefer the last HTTP/HTTPS tab, never target extension pages
@@ -144,7 +180,7 @@ updateActiveTab();
 
 // Synchronous, non-blocking message dispatcher
 function sendToTab(msg) {
-  if (activeTabId) {
+  if (activeTabId !== null) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
       activeTabId = null;
       updateActiveTab();
@@ -327,6 +363,7 @@ browser.runtime.onConnect.addListener((port) => {
             console.log(`[Cleaned Transcript]: "${cleaned}"`);
 
             if (currentMode === 'NAVIGATION') {
+<<<<<<< Updated upstream
               let matched = false;
 
               // Sort commands by length (longest first) to match "scroll down" before "down"
@@ -335,11 +372,26 @@ browser.runtime.onConnect.addListener((port) => {
               for (const [cmd, config] of sortedCommands) {
                 if (cleaned.includes(cmd)) {
                   console.log(`[Handsfree Command Triggered]: ${cmd} -> ${config.action}`);
+=======
+              const lower = normalizeTranscript(transcript);
+              const clickNumber = getNumberFromTranscript(lower);
+              if (clickNumber !== null) {
+                sendToTab({ type: 'COMMAND', command: 'CLICK_NUMBER', payload: { index: clickNumber } });
+                return;
+              }
+
+              let matched = false;
+
+              for (const [cmd, config] of COMMAND_ENTRIES) {
+                if (lower.includes(cmd)) {
+                  console.log(`[Handsfree Command Triggered]: ${cmd}`);
+>>>>>>> Stashed changes
 
                   if (config.action === 'RECENTER') {
                     if (cursorTrackingPort) {
                       cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
                     }
+<<<<<<< Updated upstream
                   } else if (config.action === 'GO_BACK') {
                     sendToTab({ type: 'COMMAND', command: 'GO_BACK' });
                   } else if (config.action === 'GO_FORWARD') {
@@ -366,6 +418,17 @@ browser.runtime.onConnect.addListener((port) => {
                     sendToTab({ type: 'COMMAND', command: 'ZOOM_OUT' });
                   } else if (config.action === 'ZOOM_RESET') {
                     sendToTab({ type: 'COMMAND', command: 'ZOOM_RESET' });
+=======
+                  } else if (config.action === 'CLOSE_TAB') {
+                    if (activeTabId !== null) {
+                      const tabToClose = activeTabId;
+                      activeTabId = null;
+                      browser.tabs.remove(tabToClose).catch((error) => {
+                        console.warn('[Handsfree] Unable to close current tab:', error);
+                        updateActiveTab();
+                      });
+                    }
+>>>>>>> Stashed changes
                   } else {
                     const isCoordCommand = ['CLICK', 'DOUBLE_CLICK', 'RIGHT_CLICK', 'HOLD', 'RELEASE'].includes(config.action);
                     const payload = isCoordCommand

@@ -291,6 +291,8 @@ let dwellAnchorY = 0;
 let dwellCooldownUntil = 0;
 let isHoldingDrag = false;
 let holdDragTarget = null;
+let clickableOverlay = null;
+let numberedClickTargets = [];
 
 // Zoom state
 let currentZoomLevel = 1.0;
@@ -347,7 +349,123 @@ function getClickableAt(x, y) {
   return el.closest('a, button, [role="button"], input, select, textarea, [tabindex], label');
 }
 
+<<<<<<< Updated upstream
 // --- 4. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
+=======
+function isVisibleElement(el) {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  return rect.width > 0 && rect.height > 0 &&
+    style.visibility !== 'hidden' && style.display !== 'none';
+}
+
+function getSearchField() {
+  const selectors = [
+    '#searchInput',
+    'input[type="search"]',
+    'input[name="q"]',
+    'textarea[name="q"]',
+    'input[name="search_query"]',
+    'input[name="search"]',
+    'textarea[name="search"]',
+    '[role="searchbox"]',
+    'input[aria-label*="search" i]',
+    'textarea[aria-label*="search" i]',
+    'input[placeholder*="search" i]',
+    'textarea[placeholder*="search" i]',
+    '.cdx-text-input__input'
+  ];
+
+  for (const selector of selectors) {
+    const field = document.querySelector(selector);
+    if (field && isVisibleElement(field) && !field.disabled && !field.readOnly) return field;
+  }
+
+  return [...document.querySelectorAll('input, textarea, [contenteditable="true"]')]
+    .find((field) => {
+      const metadata = [
+        field.getAttribute('aria-label'),
+        field.getAttribute('placeholder'),
+        field.getAttribute('name'),
+        field.id
+      ].filter(Boolean).join(' ').toLowerCase();
+      return isVisibleElement(field) && !field.disabled && !field.readOnly && metadata.includes('search');
+    }) || null;
+}
+
+function getPageClickables() {
+  const candidates = [...document.querySelectorAll(
+    'a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])'
+  )];
+  const seen = new Set();
+  return candidates.filter((el) => {
+    if (seen.has(el) || !isVisibleElement(el)) return false;
+    seen.add(el);
+    const rect = el.getBoundingClientRect();
+    return rect.top < window.innerHeight && rect.bottom > 0 &&
+      rect.left < window.innerWidth && rect.right > 0;
+  }).slice(0, 100);
+}
+
+function removeClickableOverlay() {
+  if (clickableOverlay) clickableOverlay.remove();
+  clickableOverlay = null;
+  numberedClickTargets = [];
+}
+
+function showClickableOverlay() {
+  removeClickableOverlay();
+  numberedClickTargets = getPageClickables();
+  if (!numberedClickTargets.length) return;
+
+  clickableOverlay = document.createElement('div');
+  clickableOverlay.id = 'handsfree-clickable-overlay';
+  Object.assign(clickableOverlay.style, {
+    position: 'fixed',
+    inset: '0',
+    zIndex: '2147483646',
+    pointerEvents: 'none'
+  });
+
+  numberedClickTargets.forEach((target, index) => {
+    const rect = target.getBoundingClientRect();
+    const badge = document.createElement('span');
+    badge.textContent = String(index + 1);
+    Object.assign(badge.style, {
+      position: 'fixed',
+      left: `${Math.max(0, rect.left)}px`,
+      top: `${Math.max(0, rect.top)}px`,
+      minWidth: '22px',
+      height: '22px',
+      padding: '2px 5px',
+      border: '2px solid #fff',
+      borderRadius: '6px',
+      background: '#dc2626',
+      color: '#fff',
+      font: 'bold 13px/14px sans-serif',
+      textAlign: 'center',
+      boxShadow: '0 1px 5px rgba(0,0,0,.65)'
+    });
+    clickableOverlay.appendChild(badge);
+  });
+
+  document.documentElement.appendChild(clickableOverlay);
+}
+
+function clickNumber(index) {
+  const target = numberedClickTargets[index - 1];
+  if (!target || !document.contains(target)) return;
+  removeClickableOverlay();
+  target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+  setTimeout(() => triggerClick(
+    target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2,
+    target.getBoundingClientRect().top + target.getBoundingClientRect().height / 2,
+    target
+  ), 80);
+}
+
+// --- 3. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
+>>>>>>> Stashed changes
 function updateCursorRender() {
   rafScheduled = false;
 
@@ -728,24 +846,28 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'FOCUS_SEARCH': {
-      const searchBox = document.querySelector(
-        '#searchInput, input[type="search"], textarea[name="q"], input[name="q"], input[name="search_query"], input[name="search"], textarea[name="search"], input[placeholder*="search" i], textarea[placeholder*="search" i], [role="searchbox"], input[aria-label*="search" i], button[aria-label*="search" i], .cdx-text-input__input'
-      );
+      const searchBox = getSearchField();
       if (searchBox) {
         if (typeof searchBox.scrollIntoView === 'function') {
-          searchBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          searchBox.scrollIntoView({ behavior: 'auto', block: 'center' });
         }
-        if (searchBox.tagName === 'BUTTON' || searchBox.getAttribute('role') === 'button') {
-          searchBox.click();
-        } else {
-          searchBox.focus();
-          if (typeof searchBox.select === 'function') {
-            searchBox.select();
-          }
-        }
+        searchBox.focus({ preventScroll: true });
+        if (typeof searchBox.select === 'function') searchBox.select();
       }
       break;
     }
+
+    case 'SHOW_CLICKABLES':
+      showClickableOverlay();
+      break;
+
+    case 'HIDE_CLICKABLES':
+      removeClickableOverlay();
+      break;
+
+    case 'CLICK_NUMBER':
+      clickNumber(payload?.index);
+      break;
 
     case 'CLEAR': {
       const el = document.activeElement;
