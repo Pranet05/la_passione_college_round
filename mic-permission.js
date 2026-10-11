@@ -21,7 +21,10 @@ btn.addEventListener('click', async () => {
       }
     });
 
-    const audioContext = new AudioContext({ sampleRate: 16000 });
+    const audioContext = new AudioContext({
+      sampleRate: 16000,
+      latencyHint: 'interactive'
+    });
     const source = audioContext.createMediaStreamSource(stream);
 
     // 1. High-Pass Filter: Cuts wind rumble and low-end breath pops (< 150 Hz)

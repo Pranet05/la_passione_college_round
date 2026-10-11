@@ -1,4 +1,4 @@
-// content.js - Virtual Pointer Overlay, DOM Actions & Dictation Engine
+// content.js - Virtual Pointer Overlay, DOM Actions, Dictation Engine & Speech Indicator
 
 // --- 1. Mount Hardware-Accelerated Virtual Cursor with Sticky Hold Ring ---
 let cursorEl = document.getElementById('handsfree-virtual-pointer');
@@ -60,6 +60,219 @@ if (!cursorEl) {
   }
 }
 
+// --- 2. Microphone Overlay Indicator (bottom-right, appears during speech) ---
+let micOverlay = null;
+let micToast = null;
+
+function createMicOverlay() {
+  if (micOverlay) return;
+
+  micOverlay = document.createElement('div');
+  micOverlay.id = 'handsfree-mic-overlay';
+  micOverlay.innerHTML = `
+    <style>
+      @keyframes handsfree-mic-pulse {
+        0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+        50% { transform: scale(1.08); box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+      }
+      @keyframes handsfree-ripple-ring {
+        0% { transform: translate(-50%, -50%) scale(0.6); opacity: 1; }
+        100% { transform: translate(-50%, -50%) scale(2.2); opacity: 0; }
+      }
+      @keyframes handsfree-bar-dance {
+        0%, 100% { transform: scaleY(0.3); }
+        50% { transform: scaleY(1.0); }
+      }
+      @keyframes handsfree-toast-in {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes handsfree-toast-out {
+        from { opacity: 1; transform: translateY(0); }
+        to { opacity: 0; transform: translateY(8px); }
+      }
+      #handsfree-mic-overlay {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 2147483646;
+        pointer-events: none;
+        user-select: none;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 10px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      .handsfree-mic-badge {
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #dc2626, #ef4444);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 4px 20px rgba(239, 68, 68, 0.5), 0 0 0 3px rgba(239, 68, 68, 0.2);
+        animation: handsfree-mic-pulse 1.4s ease-in-out infinite;
+        position: relative;
+        opacity: 0;
+        transition: opacity 0.25s ease;
+      }
+      .handsfree-mic-badge.active {
+        opacity: 1;
+      }
+      .handsfree-mic-badge svg {
+        width: 24px;
+        height: 24px;
+        fill: white;
+        filter: drop-shadow(0 1px 2px rgba(0,0,0,0.3));
+      }
+      .handsfree-mic-bars {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        position: absolute;
+        bottom: -8px;
+        left: 50%;
+        transform: translateX(-50%);
+      }
+      .handsfree-mic-bar {
+        width: 3px;
+        height: 14px;
+        border-radius: 2px;
+        background: white;
+        transform-origin: bottom;
+        animation: handsfree-bar-dance 0.6s ease-in-out infinite;
+      }
+      .handsfree-mic-bar:nth-child(1) { animation-delay: 0s; height: 10px; }
+      .handsfree-mic-bar:nth-child(2) { animation-delay: 0.15s; height: 14px; }
+      .handsfree-mic-bar:nth-child(3) { animation-delay: 0.3s; height: 8px; }
+      .handsfree-mic-bar:nth-child(4) { animation-delay: 0.1s; height: 12px; }
+      .handsfree-mic-bar:nth-child(5) { animation-delay: 0.25s; height: 10px; }
+      .handsfree-ripple {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        border: 2px solid rgba(239, 68, 68, 0.5);
+        transform: translate(-50%, -50%) scale(0.6);
+        animation: handsfree-ripple-ring 1.6s ease-out infinite;
+        pointer-events: none;
+      }
+      .handsfree-ripple:nth-child(2) { animation-delay: 0.4s; }
+      .handsfree-ripple:nth-child(3) { animation-delay: 0.8s; }
+      .handsfree-mic-toast {
+        background: rgba(15, 23, 42, 0.95);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        color: #f1f5f9;
+        padding: 10px 16px;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        font-size: 13px;
+        font-weight: 500;
+        max-width: 300px;
+        word-break: break-word;
+        opacity: 0;
+        transform: translateY(8px);
+        pointer-events: none;
+      }
+      .handsfree-mic-toast.show {
+        animation: handsfree-toast-in 0.25s ease forwards;
+      }
+      .handsfree-mic-toast.hide {
+        animation: handsfree-toast-out 0.25s ease forwards;
+      }
+    </style>
+    <div class="handsfree-mic-toast" id="handsfree-mic-toast"></div>
+    <div class="handsfree-mic-badge" id="handsfree-mic-badge">
+      <div class="handsfree-ripple"></div>
+      <div class="handsfree-ripple"></div>
+      <div class="handsfree-ripple"></div>
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+      </svg>
+      <div class="handsfree-mic-bars">
+        <div class="handsfree-mic-bar"></div>
+        <div class="handsfree-mic-bar"></div>
+        <div class="handsfree-mic-bar"></div>
+        <div class="handsfree-mic-bar"></div>
+        <div class="handsfree-mic-bar"></div>
+      </div>
+    </div>
+  `;
+
+  const mountOverlay = () => {
+    const parent = document.body || document.documentElement;
+    if (parent && !document.getElementById('handsfree-mic-overlay')) {
+      parent.appendChild(micOverlay);
+      micToast = document.getElementById('handsfree-mic-toast');
+    }
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mountOverlay);
+  } else {
+    mountOverlay();
+  }
+}
+
+// Initialize the mic overlay immediately
+createMicOverlay();
+
+// --- Speech State Management ---
+let speechFrozen = false;
+let frozenX = 0;
+let frozenY = 0;
+let toastHideTimeout = null;
+
+function showMicActive() {
+  const badge = document.getElementById('handsfree-mic-badge');
+  if (badge) badge.classList.add('active');
+  
+  // Freeze the cursor at its current position
+  speechFrozen = true;
+  frozenX = currentScreenX;
+  frozenY = currentScreenY;
+  
+  // Add speech-detected ripple effect around the frozen cursor
+  if (pointerDot) {
+    pointerDot.style.backgroundColor = '#f59e0b';
+    pointerDot.style.boxShadow = '0 0 16px rgba(245, 158, 11, 0.9), 0 0 32px rgba(245, 158, 11, 0.4)';
+  }
+}
+
+function hideMicActive() {
+  const badge = document.getElementById('handsfree-mic-badge');
+  if (badge) badge.classList.remove('active');
+  
+  // Unfreeze cursor
+  speechFrozen = false;
+  
+  // Restore cursor appearance
+  if (pointerDot && !isHoldingDrag) {
+    pointerDot.style.backgroundColor = 'rgba(239, 68, 68, 0.95)';
+    pointerDot.style.boxShadow = '0 0 10px rgba(239, 68, 68, 0.8), 0 0 3px rgba(0,0,0,0.5)';
+  }
+}
+
+function showCommandToast(text, duration = 3000) {
+  if (!micToast) micToast = document.getElementById('handsfree-mic-toast');
+  if (!micToast) return;
+  
+  clearTimeout(toastHideTimeout);
+  micToast.textContent = text;
+  micToast.className = 'handsfree-mic-toast show';
+  
+  toastHideTimeout = setTimeout(() => {
+    micToast.className = 'handsfree-mic-toast hide';
+  }, duration);
+}
+
 // Coordinate state
 let currentScreenX = window.innerWidth / 2;
 let currentScreenY = window.innerHeight / 2;
@@ -79,12 +292,15 @@ let dwellCooldownUntil = 0;
 let isHoldingDrag = false;
 let holdDragTarget = null;
 
+// Zoom state
+let currentZoomLevel = 1.0;
+
 // Track mouse position if physical mouse is used
 document.addEventListener('mousemove', (e) => {
   lastHoveredElement = e.target;
 }, { passive: true });
 
-// --- 2. Focus Monitoring for Automatic Mode Switching ---
+// --- 3. Focus Monitoring for Automatic Mode Switching ---
 function isTextInput(el) {
   if (!el) return false;
   const tag = el.tagName?.toLowerCase();
@@ -131,9 +347,18 @@ function getClickableAt(x, y) {
   return el.closest('a, button, [role="button"], input, select, textarea, [tabindex], label');
 }
 
-// --- 3. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
+// --- 4. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
 function updateCursorRender() {
   rafScheduled = false;
+
+  // If speech is frozen, keep cursor at frozen position
+  if (speechFrozen) {
+    if (cursorEl) {
+      cursorEl.style.transform = `translate3d(${frozenX - 18}px, ${frozenY - 18}px, 0)`;
+    }
+    // Still schedule next frame for when it unfreezes
+    return;
+  }
 
   // Sticky magnetic friction over clickable targets
   const clickable = getClickableAt(targetScreenX, targetScreenY);
@@ -169,11 +394,11 @@ function updateCursorRender() {
   checkStickyDwellHold(clickable);
 }
 
-// --- 4. Sticky Dwell Hold Engine (Hold Still to Auto-Click) ---
+// --- 5. Sticky Dwell Hold Engine (Hold Still to Auto-Click) ---
 function checkStickyDwellHold(clickable) {
   const now = performance.now();
 
-  if (!stickyHoldEnabled || isHoldingDrag || now < dwellCooldownUntil) {
+  if (!stickyHoldEnabled || isHoldingDrag || now < dwellCooldownUntil || speechFrozen) {
     resetDwellRing();
     return;
   }
@@ -232,9 +457,13 @@ function resetDwellRing() {
   }
 }
 
-// --- 5. Message Listener ---
+// --- 6. Message Listener ---
 browser.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'UPDATE_CURSOR') {
+    // Don't update target when speech is frozen – the background already blocks these,
+    // but double-check here for safety
+    if (speechFrozen) return;
+
     targetScreenX = msg.x * window.innerWidth;
     targetScreenY = msg.y * window.innerHeight;
 
@@ -245,8 +474,42 @@ browser.runtime.onMessage.addListener((msg) => {
       rafScheduled = true;
       requestAnimationFrame(updateCursorRender);
     }
+  } else if (msg.type === 'SPEECH_ACTIVE') {
+    showMicActive();
+  } else if (msg.type === 'SPEECH_IDLE') {
+    hideMicActive();
   } else if (msg.type === 'COMMAND') {
     handleNavigationCommand(msg.command, msg.payload);
+  } else if (msg.type === 'COMMAND_FEEDBACK') {
+    if (msg.command) {
+      const friendlyNames = {
+        'SCROLL': '⬇️ Scrolling',
+        'CLICK': '👆 Clicked',
+        'DOUBLE_CLICK': '👆👆 Double Clicked',
+        'RIGHT_CLICK': '🖱️ Right Clicked',
+        'HOLD': '✊ Holding',
+        'RELEASE': '🖐️ Released',
+        'FOCUS_SEARCH': '🔍 Search Focused',
+        'RECENTER': '🎯 Recentered',
+        'CLEAR': '🧹 Cleared',
+        'GO_BACK': '⬅️ Going Back',
+        'GO_FORWARD': '➡️ Going Forward',
+        'REFRESH': '🔄 Refreshing',
+        'SCROLL_TO_TOP': '⬆️ Top of Page',
+        'SCROLL_TO_BOTTOM': '⬇️ Bottom of Page',
+        'NEW_TAB': '📄 New Tab',
+        'CLOSE_TAB': '❌ Tab Closed',
+        'TAB_RIGHT': '➡️ Next Tab',
+        'TAB_LEFT': '⬅️ Previous Tab',
+        'ZOOM_IN': '🔍+ Zoomed In',
+        'ZOOM_OUT': '🔍- Zoomed Out',
+        'ZOOM_RESET': '🔍 Zoom Reset',
+        'SUBMIT_SEARCH': '🔎 Submitted'
+      };
+      showCommandToast(friendlyNames[msg.command] || `✅ ${msg.command}`);
+    } else {
+      showCommandToast(`🎤 "${msg.transcript}" — no command matched`, 2000);
+    }
   } else if (msg.type === 'INJECT_TEXT') {
     injectTextIntoActiveElement(msg.text);
   } else if (msg.type === 'MODE_CHANGE') {
@@ -258,7 +521,7 @@ browser.runtime.onMessage.addListener((msg) => {
   }
 });
 
-// --- 6. Command Execution & Click / Hold / Release ---
+// --- 7. Command Execution & Click / Hold / Release ---
 function handleNavigationCommand(command, payload) {
   switch (command) {
     case 'SCROLL': {
@@ -268,6 +531,49 @@ function handleNavigationCommand(command, payload) {
       } else {
         window.scrollBy({ top: payload.y, behavior: 'smooth' });
       }
+      break;
+    }
+
+    case 'SCROLL_TO_TOP': {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      break;
+    }
+
+    case 'SCROLL_TO_BOTTOM': {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      break;
+    }
+
+    case 'GO_BACK': {
+      window.history.back();
+      break;
+    }
+
+    case 'GO_FORWARD': {
+      window.history.forward();
+      break;
+    }
+
+    case 'REFRESH': {
+      window.location.reload();
+      break;
+    }
+
+    case 'ZOOM_IN': {
+      currentZoomLevel = Math.min(3.0, currentZoomLevel + 0.2);
+      document.body.style.zoom = currentZoomLevel;
+      break;
+    }
+
+    case 'ZOOM_OUT': {
+      currentZoomLevel = Math.max(0.4, currentZoomLevel - 0.2);
+      document.body.style.zoom = currentZoomLevel;
+      break;
+    }
+
+    case 'ZOOM_RESET': {
+      currentZoomLevel = 1.0;
+      document.body.style.zoom = 1.0;
       break;
     }
 
@@ -305,6 +611,35 @@ function handleNavigationCommand(command, payload) {
       const clickX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const clickY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
       triggerClick(clickX, clickY);
+      break;
+    }
+
+    case 'DOUBLE_CLICK': {
+      const dblX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
+      const dblY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
+      triggerClick(dblX, dblY);
+      setTimeout(() => triggerClick(dblX, dblY), 80);
+      break;
+    }
+
+    case 'RIGHT_CLICK': {
+      const rcX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
+      const rcY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
+      
+      if (cursorEl) cursorEl.style.display = 'none';
+      let rcTarget = document.elementFromPoint(rcX, rcY);
+      if (cursorEl) cursorEl.style.display = 'flex';
+
+      if (rcTarget) {
+        rcTarget.dispatchEvent(new MouseEvent('contextmenu', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: rcX,
+          clientY: rcY,
+          button: 2
+        }));
+      }
       break;
     }
 
@@ -512,7 +847,7 @@ function triggerClick(clickX, clickY, knownTarget = null) {
   }
 }
 
-// --- 7. Dictation Text Injection ---
+// --- 8. Dictation Text Injection ---
 function injectTextIntoActiveElement(text) {
   const el = document.activeElement;
   if (!el || !isTextInput(el)) return;

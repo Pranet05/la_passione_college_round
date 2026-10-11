@@ -16,10 +16,17 @@ let cursorTrackingPort = null;
 // Synchronous active tab cache to eliminate IPC roundtrip lag during cursor streaming
 let activeTabId = null;
 
+// Speech activity state – broadcasted to content scripts
+let isSpeechActive = false;
+let speechActivityTimeout = null;
+
 // High-speed VAD parameters: ~250ms pause triggers inference
 const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
+
+// How long after last speech frame before we consider speech ended (if no command fires)
+const SPEECH_COOLDOWN_MS = 600;
 
 const COMMANDS = {
   // Navigation scrolling
@@ -27,8 +34,8 @@ const COMMANDS = {
   'scroll up': { action: 'SCROLL', payload: { y: -600 } },
   'down': { action: 'SCROLL', payload: { y: 350 } },
   'up': { action: 'SCROLL', payload: { y: -350 } },
-  'page down': { action: 'SCROLL', payload: { y: 600 } },
-  'page up': { action: 'SCROLL', payload: { y: -600 } },
+  'page down': { action: 'SCROLL', payload: { y: 900 } },
+  'page up': { action: 'SCROLL', payload: { y: -900 } },
 
   // Click & phonetic Whisper variations
   'click': { action: 'CLICK' },
@@ -38,6 +45,14 @@ const COMMANDS = {
   'tap': { action: 'CLICK' },
   'press': { action: 'CLICK' },
   'select': { action: 'CLICK' },
+
+  // Double Click
+  'double click': { action: 'DOUBLE_CLICK' },
+  'double tap': { action: 'DOUBLE_CLICK' },
+
+  // Right Click (context menu)
+  'right click': { action: 'RIGHT_CLICK' },
+  'context menu': { action: 'RIGHT_CLICK' },
 
   // Sticky Hold & Release (Mouse Down / Drag / Drop)
   'sticky hold': { action: 'HOLD' },
@@ -57,10 +72,38 @@ const COMMANDS = {
   'center': { action: 'RECENTER' },
 
   // Input reset
-  'clear': { action: 'CLEAR' }
+  'clear': { action: 'CLEAR' },
+
+  // Browser navigation
+  'go back': { action: 'GO_BACK' },
+  'back': { action: 'GO_BACK' },
+  'go forward': { action: 'GO_FORWARD' },
+  'forward': { action: 'GO_FORWARD' },
+  'refresh': { action: 'REFRESH' },
+  'reload': { action: 'REFRESH' },
+
+  // Page position
+  'go to top': { action: 'SCROLL_TO_TOP' },
+  'top': { action: 'SCROLL_TO_TOP' },
+  'go to bottom': { action: 'SCROLL_TO_BOTTOM' },
+  'bottom': { action: 'SCROLL_TO_BOTTOM' },
+
+  // Tab management
+  'new tab': { action: 'NEW_TAB' },
+  'close tab': { action: 'CLOSE_TAB' },
+  'next tab': { action: 'TAB_RIGHT' },
+  'tab right': { action: 'TAB_RIGHT' },
+  'previous tab': { action: 'TAB_LEFT' },
+  'tab left': { action: 'TAB_LEFT' },
+
+  // Zoom
+  'zoom in': { action: 'ZOOM_IN' },
+  'zoom out': { action: 'ZOOM_OUT' },
+  'reset zoom': { action: 'ZOOM_RESET' },
 };
 
 // 1. Maintain Active Web Tab Target Synchronously
+// CRITICAL: Always prefer the last HTTP/HTTPS tab, never target extension pages
 async function updateActiveTab() {
   try {
     const focusedTabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
@@ -70,10 +113,22 @@ async function updateActiveTab() {
       return;
     }
 
+    // Fallback: find any active web tab across all windows
     const allTabs = await browser.tabs.query({ active: true });
     const fallback = allTabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
     if (fallback?.id) {
       activeTabId = fallback.id;
+      return;
+    }
+
+    // Last resort: find ANY web tab (even if not active)
+    const webTabs = await browser.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+    if (webTabs.length > 0) {
+      // Pick the most recently accessed one
+      const sorted = webTabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      if (sorted[0]?.id) {
+        activeTabId = sorted[0].id;
+      }
     }
   } catch (e) {
     // Fail silently during transitions
@@ -87,7 +142,7 @@ if (browser.windows?.onFocusChanged) {
 }
 updateActiveTab();
 
-// Synchronous, non-blocking message dispatcher (Zero IPC query lag!)
+// Synchronous, non-blocking message dispatcher
 function sendToTab(msg) {
   if (activeTabId) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
@@ -96,6 +151,52 @@ function sendToTab(msg) {
     });
   } else {
     updateActiveTab();
+  }
+}
+
+// Broadcast to ALL web tabs (for speech state changes that affect all pages)
+async function broadcastToAllWebTabs(msg) {
+  try {
+    const tabs = await browser.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+    for (const tab of tabs) {
+      if (tab.id) {
+        browser.tabs.sendMessage(tab.id, msg).catch(() => {});
+      }
+    }
+  } catch (e) {}
+}
+
+// --- Speech Activity State Management ---
+function setSpeechActive() {
+  if (!isSpeechActive) {
+    isSpeechActive = true;
+    console.log('[Handsfree] Speech detected – freezing cursor.');
+    broadcastToAllWebTabs({ type: 'SPEECH_ACTIVE' });
+  }
+  // Reset the cooldown timer every time we detect speech
+  clearTimeout(speechActivityTimeout);
+  speechActivityTimeout = null;
+}
+
+function scheduleSpeechIdle() {
+  // Don't immediately go idle – wait for SPEECH_COOLDOWN_MS of silence
+  if (speechActivityTimeout) return; // Already scheduled
+  speechActivityTimeout = setTimeout(() => {
+    if (isSpeechActive) {
+      isSpeechActive = false;
+      console.log('[Handsfree] Speech ended – resuming cursor.');
+      broadcastToAllWebTabs({ type: 'SPEECH_IDLE' });
+    }
+    speechActivityTimeout = null;
+  }, SPEECH_COOLDOWN_MS);
+}
+
+function forceSpeechIdle() {
+  clearTimeout(speechActivityTimeout);
+  speechActivityTimeout = null;
+  if (isSpeechActive) {
+    isSpeechActive = false;
+    broadcastToAllWebTabs({ type: 'SPEECH_IDLE' });
   }
 }
 
@@ -114,6 +215,32 @@ async function initEngine() {
 
 initEngine();
 
+// --- Whisper Transcript Cleaning ---
+// Whisper-tiny often hallucinates artifacts like [Music], (silence), Thank you., etc.
+function cleanTranscript(raw) {
+  let cleaned = raw
+    .replace(/\[.*?\]/g, '')           // [Music], [BLANK_AUDIO], etc.
+    .replace(/\(.*?\)/g, '')           // (silence), (music), etc.
+    .replace(/^[.!?,;:\-–—\s]+/, '')   // Leading punctuation/whitespace
+    .replace(/[.!?,;:\-–—\s]+$/, '')   // Trailing punctuation/whitespace
+    .trim()
+    .toLowerCase();
+  
+  // Filter known Whisper hallucination phrases
+  const hallucinations = [
+    'thank you', 'thanks for watching', 'subscribe', 'like and subscribe',
+    'you', 'bye', 'okay', 'oh', 'uh', 'um', 'hmm', 'huh',
+    'the', 'a', 'i', 'it', 'is', 'so', 'and', 'but',
+    'thank you for watching', 'thanks', 'see you'
+  ];
+  
+  if (hallucinations.includes(cleaned)) {
+    return '';
+  }
+  
+  return cleaned;
+}
+
 // 3. Port Connections (Audio & Tracker Streams)
 browser.runtime.onConnect.addListener((port) => {
   // --- High-Speed Nose Tracking Stream ---
@@ -130,11 +257,16 @@ browser.runtime.onConnect.addListener((port) => {
         latestCursor.x = msg.x;
         latestCursor.y = msg.y;
 
-        sendToTab({
-          type: 'UPDATE_CURSOR',
-          x: msg.x,
-          y: msg.y
-        });
+        // Only forward cursor updates if speech is NOT active (cursor frozen during speech)
+        if (!isSpeechActive) {
+          sendToTab({
+            type: 'UPDATE_CURSOR',
+            x: msg.x,
+            y: msg.y,
+            stickyHold: msg.stickyHold,
+            dwellDuration: msg.dwellDuration
+          });
+        }
       }
     });
   }
@@ -155,6 +287,9 @@ browser.runtime.onConnect.addListener((port) => {
       if (isSpeech) {
         audioBufferChunk.push(chunk);
         silenceFrames = 0;
+
+        // Signal speech activity to content scripts IMMEDIATELY
+        setSpeechActive();
       } else if (audioBufferChunk.length > 0) {
         silenceFrames++;
         audioBufferChunk.push(chunk);
@@ -165,7 +300,10 @@ browser.runtime.onConnect.addListener((port) => {
           silenceFrames = 0;
 
           // Drop noise bursts shorter than 0.20 seconds
-          if (fullBuffer.length < 16000 * 0.20) return;
+          if (fullBuffer.length < 16000 * 0.20) {
+            scheduleSpeechIdle();
+            return;
+          }
 
           console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
 
@@ -179,38 +317,86 @@ browser.runtime.onConnect.addListener((port) => {
             transcript = transcript.trim();
             console.log(`[Raw Model Output]: "${transcript}"`);
 
-            if (!transcript) return;
+            const cleaned = cleanTranscript(transcript);
+            if (!cleaned) {
+              console.log('[Handsfree] Filtered hallucination / noise, ignoring.');
+              forceSpeechIdle();
+              return;
+            }
+
+            console.log(`[Cleaned Transcript]: "${cleaned}"`);
 
             if (currentMode === 'NAVIGATION') {
-              const lower = transcript.toLowerCase();
               let matched = false;
 
-              for (const [cmd, config] of Object.entries(COMMANDS)) {
-                if (lower.includes(cmd)) {
-                  console.log(`[Handsfree Command Triggered]: ${cmd}`);
+              // Sort commands by length (longest first) to match "scroll down" before "down"
+              const sortedCommands = Object.entries(COMMANDS).sort((a, b) => b[0].length - a[0].length);
+
+              for (const [cmd, config] of sortedCommands) {
+                if (cleaned.includes(cmd)) {
+                  console.log(`[Handsfree Command Triggered]: ${cmd} -> ${config.action}`);
 
                   if (config.action === 'RECENTER') {
                     if (cursorTrackingPort) {
                       cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
                     }
+                  } else if (config.action === 'GO_BACK') {
+                    sendToTab({ type: 'COMMAND', command: 'GO_BACK' });
+                  } else if (config.action === 'GO_FORWARD') {
+                    sendToTab({ type: 'COMMAND', command: 'GO_FORWARD' });
+                  } else if (config.action === 'REFRESH') {
+                    sendToTab({ type: 'COMMAND', command: 'REFRESH' });
+                  } else if (config.action === 'SCROLL_TO_TOP') {
+                    sendToTab({ type: 'COMMAND', command: 'SCROLL_TO_TOP' });
+                  } else if (config.action === 'SCROLL_TO_BOTTOM') {
+                    sendToTab({ type: 'COMMAND', command: 'SCROLL_TO_BOTTOM' });
+                  } else if (config.action === 'NEW_TAB') {
+                    browser.tabs.create({}).catch(() => {});
+                  } else if (config.action === 'CLOSE_TAB') {
+                    if (activeTabId) {
+                      browser.tabs.remove(activeTabId).catch(() => {});
+                      activeTabId = null;
+                      updateActiveTab();
+                    }
+                  } else if (config.action === 'TAB_RIGHT' || config.action === 'TAB_LEFT') {
+                    switchTab(config.action === 'TAB_RIGHT' ? 1 : -1);
+                  } else if (config.action === 'ZOOM_IN') {
+                    sendToTab({ type: 'COMMAND', command: 'ZOOM_IN' });
+                  } else if (config.action === 'ZOOM_OUT') {
+                    sendToTab({ type: 'COMMAND', command: 'ZOOM_OUT' });
+                  } else if (config.action === 'ZOOM_RESET') {
+                    sendToTab({ type: 'COMMAND', command: 'ZOOM_RESET' });
                   } else {
-                    const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
+                    const isCoordCommand = ['CLICK', 'DOUBLE_CLICK', 'RIGHT_CLICK', 'HOLD', 'RELEASE'].includes(config.action);
                     const payload = isCoordCommand
                       ? { x: latestCursor.x, y: latestCursor.y }
                       : config.payload;
 
                     sendToTab({ type: 'COMMAND', command: config.action, payload });
                   }
+
+                  // Show command feedback toast on the content page
+                  sendToTab({
+                    type: 'COMMAND_FEEDBACK',
+                    command: config.action,
+                    transcript: cleaned
+                  });
+
                   matched = true;
                   break;
                 }
               }
 
               if (!matched) {
-                console.log(`[Handsfree] No navigation command matched in: "${lower}"`);
+                console.log(`[Handsfree] No navigation command matched in: "${cleaned}"`);
+                sendToTab({
+                  type: 'COMMAND_FEEDBACK',
+                  command: null,
+                  transcript: cleaned
+                });
               }
             } else if (currentMode === 'DICTATION') {
-              const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
+              const cleanText = cleaned.replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
               if (cleanText.includes('stop dictating') || cleanText.includes('escape')) {
                 currentMode = 'NAVIGATION';
@@ -241,11 +427,35 @@ browser.runtime.onConnect.addListener((port) => {
           } catch (err) {
             console.error('[Handsfree] Inference error:', err);
           }
+
+          // After processing, signal that speech is done
+          forceSpeechIdle();
+        }
+      } else {
+        // No speech and no buffered audio — schedule idle if we were active
+        if (isSpeechActive) {
+          scheduleSpeechIdle();
         }
       }
     });
   }
 });
+
+// Tab switching helper
+async function switchTab(direction) {
+  try {
+    const tabs = await browser.tabs.query({ currentWindow: true });
+    if (tabs.length < 2) return;
+    
+    const currentIndex = tabs.findIndex(t => t.active);
+    if (currentIndex === -1) return;
+    
+    let nextIndex = (currentIndex + direction + tabs.length) % tabs.length;
+    await browser.tabs.update(tabs[nextIndex].id, { active: true });
+  } catch (e) {
+    console.warn('[Handsfree] Tab switch error:', e);
+  }
+}
 
 // Audio math helpers
 function calculateRMS(buffer) {
