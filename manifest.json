@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Handsfree Voice & Accessibility Engine",
+  "name": "Handsfree Voice & Vision Interaction System",
   "version": "1.0.0",
-  "description": "Client-side private voice navigation and dictation using Whisper Tiny.",
+  "description": "Hands-free browser interaction combining local Whisper speech recognition and webcam nose tracking.",
   "permissions": [
     "tabs",
-    "activeTab"
+    "activeTab",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -29,6 +30,18 @@
       "matches": ["<all_urls>"],
       "js": ["content/content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/*",
+        "vendor/wasm/*",
+        "vendor/face_landmarker.task",
+        "tracker/*",
+        "tracker/worker.js"
+      ],
+      "matches": ["<all_urls>"]
     }
   ]
 }

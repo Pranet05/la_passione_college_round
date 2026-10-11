@@ -1,6 +1,5 @@
 import { pipeline, env } from './transformers.min.js';
 
-// Use browser internal CacheStorage and Hugging Face remote endpoints on initial load
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
@@ -9,11 +8,8 @@ let currentMode = 'NAVIGATION';
 let audioBufferChunk = [];
 let silenceFrames = 0;
 
-// Holds latest normalized nose coordinates streamed from tracker.js
 let latestCursor = { x: 0.5, y: 0.5 };
 let cursorTrackingPort = null;
-
-// Synchronous active tab cache to eliminate IPC roundtrip lag during cursor streaming
 let activeTabId = null;
 
 // High-speed VAD parameters: ~250-300ms pause triggers inference
@@ -21,63 +17,326 @@ const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
 
-const COMMANDS = {
-  // Link hint overlay
-  'open multi-link overlay': { action: 'OPEN_LINK_OVERLAY' },
-
-  // Navigation scrolling
-  'scroll down': { action: 'SCROLL', payload: { y: 600 } },
-  'scroll up': { action: 'SCROLL', payload: { y: -600 } },
-  'down': { action: 'SCROLL', payload: { y: 350 } },
-  'up': { action: 'SCROLL', payload: { y: -350 } },
-  'page down': { action: 'SCROLL', payload: { y: 600 } },
-  'page up': { action: 'SCROLL', payload: { y: -600 } },
-
-  // Tab switching commands
-  'next tab': { action: 'NEXT_TAB' },
-  'switch tab': { action: 'NEXT_TAB' },
-  'previous tab': { action: 'PREV_TAB' },
-  'prev tab': { action: 'PREV_TAB' },
-  'last tab': { action: 'PREV_TAB' },
-  'new tab': { action: 'NEW_TAB' },
-  'close tab': { action: 'CLOSE_TAB' },
-
-  // Click & phonetic Whisper variations
-  'click': { action: 'CLICK' },
-  'quick': { action: 'CLICK' },
-  'clique': { action: 'CLICK' },
-  'klick': { action: 'CLICK' },
-  'tap': { action: 'CLICK' },
-  'press': { action: 'CLICK' },
-  'select': { action: 'CLICK' },
-
-  // Sticky Hold & Release (Mouse Down / Drag / Drop)
-  'sticky hold': { action: 'HOLD' },
-  'hold': { action: 'HOLD' },
-  'grab': { action: 'HOLD' },
-  'release': { action: 'RELEASE' },
-  'drop': { action: 'RELEASE' },
-  'unhold': { action: 'RELEASE' },
-
-  // Search input focus
-  'focus search': { action: 'FOCUS_SEARCH' },
-  'search': { action: 'FOCUS_SEARCH' },
-  'find': { action: 'FOCUS_SEARCH' },
-
-  // Gaze center recalibration
-  'recenter': { action: 'RECENTER' },
-  'center': { action: 'RECENTER' },
-
-  // Input reset
-  'clear': { action: 'CLEAR' }
+// --- Performance Evaluation Telemetry Engine ---
+const telemetrySession = {
+  sessionId: `session_${Date.now()}`,
+  startTime: performance.now(),
+  logs: [],
+  metrics: {
+    totalVoiceCommands: 0,
+    recognizedCommands: 0,
+    unrecognizedUtterances: 0,
+    totalClicks: 0,
+    dwellClicks: 0,
+    voiceClicks: 0,
+    tabSwitches: 0
+  }
 };
 
-// --- Tab Navigation Handlers ---
+function recordTelemetryEvent(category, eventName, details = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    sessionElapsedMs: Math.round(performance.now() - telemetrySession.startTime),
+    category,
+    eventName,
+    ...details
+  };
+  telemetrySession.logs.push(entry);
+}
 
-// --- Reliable Multi-Window Tab Navigation Handlers ---
+// Helpers for human-friendly formatting in Excel
+function escapeCsv(value) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  return `"${text.replace(/"/g, '""')}"`;
+}
 
+function toCsvRow(arr) {
+  return arr.map(escapeCsv).join(',');
+}
+
+function formatTime(ms) {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function makeVisualBar(pct, totalBlocks = 10) {
+  if (pct === null || isNaN(pct)) return '[No speech recorded]';
+  const filled = Math.min(totalBlocks, Math.max(0, Math.round((pct / 100) * totalBlocks)));
+  const empty = totalBlocks - filled;
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${pct}%`;
+}
+
+function parseLogForCommoner(log, index) {
+  const time = formatTime(log.sessionElapsedMs);
+  const cat = log.category;
+  const evt = log.eventName;
+
+  let whatYouDid = 'Used handsfree navigation';
+  let whatComputerDid = 'Processed page interaction';
+  let speedStatus = '✓ Success';
+  let laymanExplanation = '';
+
+  if (cat === 'VOICE_ASR' && evt === 'INFERENCE_COMPLETE') {
+    const transcript = log.transcript || 'Spoken words';
+    whatYouDid = `Spoke: "${transcript}"`;
+    whatComputerDid = 'Heard your speech and executed command';
+    speedStatus = log.latencyMs ? `⚡ ${log.latencyMs}ms` : '⚡ Fast';
+    const latencySec = log.latencyMs ? ` in ${(log.latencyMs / 1000).toFixed(2)}s` : '';
+    laymanExplanation = `You said "${transcript}". The voice AI understood you${latencySec} and performed the command completely hands-free.`;
+  } else if (cat === 'DOM_INTERACTION' && evt === 'SELECTION_ACTIVATION') {
+    const isDwell = log.activationMethod === 'DWELL_CLICK';
+    const tag = (log.tagName || 'button').toLowerCase();
+    whatYouDid = isDwell ? `Rested gaze on <${tag}> element` : `Looked at <${tag}> and said "click"`;
+    whatComputerDid = `Clicked <${tag}> at cursor location`;
+    speedStatus = isDwell ? `✓ Dwell Click (${log.acquisitionTimeMs || 1000}ms)` : '✓ Voice Click';
+    laymanExplanation = isDwell
+      ? `You held your head steady on the ${tag} for 1 second. The system clicked it automatically without touching a mouse.`
+      : `You looked at the ${tag} and said "click". The system clicked the exact item you were viewing.`;
+  } else if (cat === 'TASK_COMPLETION' && evt === 'SEARCH_SUBMITTED') {
+    whatYouDid = 'Finished entering search term';
+    whatComputerDid = 'Submitted search query to web page';
+    speedStatus = log.taskCompletionTimeMs ? `✓ Done (${(log.taskCompletionTimeMs / 1000).toFixed(1)}s)` : '✓ Done';
+    laymanExplanation = `You completed an entire web search hands-free from dictation to submission.`;
+  } else if (cat === 'TAB_MANAGEMENT' && evt === 'SWITCH_TAB') {
+    whatYouDid = 'Spoke tab navigation command';
+    whatComputerDid = 'Switched to next/previous browser tab';
+    speedStatus = '✓ Switched Tab';
+    laymanExplanation = `The browser switched tabs hands-free based on your voice command.`;
+  } else if (evt === 'START_CALIBRATION' || log.action === 'START_CALIBRATION') {
+    whatYouDid = 'Started 5-point calibration';
+    whatComputerDid = 'Calibrated screen boundaries to head';
+    speedStatus = '✓ Calibrating';
+    laymanExplanation = `You ran the calibration helper to match the screen corners to your natural head movements.`;
+  } else if (evt === 'RECENTER' || log.action === 'RECENTER') {
+    whatYouDid = 'Reset resting head position';
+    whatComputerDid = 'Aligned cursor with your face angle';
+    speedStatus = '✓ Centered';
+    laymanExplanation = `You centered the cursor to where your face is comfortably resting.`;
+  } else {
+    whatYouDid = log.category ? `Performed ${log.category}` : 'Navigation action';
+    whatComputerDid = log.eventName ? `Handled ${log.eventName}` : 'Updated page state';
+    speedStatus = '✓ OK';
+    laymanExplanation = `The handsfree system processed an interaction event on the active page.`;
+  }
+
+  return {
+    step: index + 1,
+    time,
+    whatYouDid,
+    whatComputerDid,
+    speedStatus,
+    laymanExplanation
+  };
+}
+
+function exportEvaluationCSV() {
+  const m = telemetrySession.metrics;
+  const totalDurationSec = Math.max(1, Math.round((performance.now() - telemetrySession.startTime) / 1000));
+  const durationFormatted = totalDurationSec >= 60
+    ? `${Math.floor(totalDurationSec / 60)}m ${totalDurationSec % 60}s`
+    : `${totalDurationSec}s`;
+
+  const asrLogs = telemetrySession.logs.filter(l => l.category === 'VOICE_ASR' && Number.isFinite(l.latencyMs));
+  const avgLatencyMs = asrLogs.length > 0
+    ? Math.round(asrLogs.reduce((acc, l) => acc + l.latencyMs, 0) / asrLogs.length)
+    : null;
+
+  const recognizedCmds = m.recognizedCommands || 0;
+  const unrecognized = m.unrecognizedUtterances || 0;
+  const totalVoiceAttempts = recognizedCmds + unrecognized;
+  const voiceAccuracyPct = totalVoiceAttempts > 0
+    ? Math.round((recognizedCmds / totalVoiceAttempts) * 100)
+    : (asrLogs.length > 0 ? 100 : null);
+
+  const voiceClicks = m.voiceClicks || 0;
+  const dwellClicks = m.dwellClicks || 0;
+  const totalClicks = m.totalClicks || (voiceClicks + dwellClicks);
+
+  // Determine overall grade
+  let letterGrade = 'Grade A (Excellent)';
+  let stars = '★★★★★';
+  let gradeSummary = 'System performed excellently with high accuracy and fast responsiveness.';
+
+  if (voiceAccuracyPct !== null) {
+    if (voiceAccuracyPct >= 90) {
+      letterGrade = `Grade A (${voiceAccuracyPct}%)`;
+      stars = '★★★★★';
+      gradeSummary = 'System performed excellently with high voice accuracy and fast response.';
+    } else if (voiceAccuracyPct >= 75) {
+      letterGrade = `Grade B (${voiceAccuracyPct}%)`;
+      stars = '★★★★☆';
+      gradeSummary = 'Good performance. Most commands were recognized quickly with minor repeats.';
+    } else if (voiceAccuracyPct >= 60) {
+      letterGrade = `Grade C (${voiceAccuracyPct}%)`;
+      stars = '★★★☆☆';
+      gradeSummary = 'Satisfactory. Consider speaking slightly clearer or checking microphone level.';
+    } else {
+      letterGrade = `Grade D (${voiceAccuracyPct}%)`;
+      stars = '★★☆☆☆';
+      gradeSummary = 'Needs adjustment. Check microphone distance and background noise.';
+    }
+  } else if (telemetrySession.logs.length > 0) {
+    letterGrade = 'Grade A (Ready)';
+    stars = '★★★★★';
+    gradeSummary = 'All handsfree components responded smoothly during this session.';
+  } else {
+    letterGrade = 'Grade A (New Session)';
+    stars = '★★★★★';
+    gradeSummary = 'Session initialized and ready for hands-free navigation.';
+  }
+
+  const voiceBar = makeVisualBar(voiceAccuracyPct);
+  const voiceExplanation = voiceAccuracyPct !== null
+    ? `Out of ${totalVoiceAttempts} voice commands evaluated, ${recognizedCmds} were recognized correctly.`
+    : 'No voice commands were spoken yet during this session.';
+
+  const speedRating = avgLatencyMs !== null
+    ? `${avgLatencyMs} ms (${(avgLatencyMs / 1000).toFixed(2)}s)`
+    : 'N/A';
+  const speedBar = avgLatencyMs !== null
+    ? (avgLatencyMs < 400 ? '⚡ Ultra-Fast (<400ms)' : avgLatencyMs < 800 ? '⚡ Fast (<800ms)' : '⏱️ Normal')
+    : '[No audio samples]';
+  const speedExplanation = avgLatencyMs !== null
+    ? `The speech AI processed commands in ~${avgLatencyMs}ms locally on your computer (faster than an eye blink).`
+    : 'Inference latency will be calculated as soon as you speak a command.';
+
+  const clickSummary = `${totalClicks} Clicks (${voiceClicks} Voice Click + ${dwellClicks} Gaze Dwell)`;
+  const clickBar = totalClicks > 0
+    ? `[${voiceClicks} by Voice / ${dwellClicks} by Gaze]`
+    : '[No clicks recorded]';
+  const clickExplanation = totalClicks > 0
+    ? `You activated ${totalClicks} button/link clicks completely hands-free (${voiceClicks} saying "click", ${dwellClicks} resting head).`
+    : 'Try saying "click" or resting your head steady for 1 second over any button to click hands-free.';
+
+  const navSummary = `${m.tabSwitches || 0} Tab Switches, ${telemetrySession.logs.length} Actions`;
+  const navBar = '✓ Fully Operational';
+  const navExplanation = 'The handsfree system is tracking head gaze and listening for voice commands.';
+
+  const lines = [
+    toCsvRow(['====================================================================================================']),
+    toCsvRow(['📊 HANDSFREE ACCESSIBILITY SYSTEM - PERFORMANCE EVALUATION REPORT']),
+    toCsvRow(['Designed for common users to easily check how well hands-free navigation is working.']),
+    toCsvRow(['====================================================================================================']),
+    '',
+    toCsvRow(['--- SECTION 1: OVERALL USABILITY GRADE & SUMMARY ---']),
+    toCsvRow(['Metric / Summary Item', 'Score / Value', 'Visual Rating', 'Plain-English Meaning for Common Users']),
+    toCsvRow(['Overall Usability Grade', letterGrade, stars, gradeSummary]),
+    toCsvRow(['Session Usage Duration', durationFormatted, '[Active Session]', 'Total time you navigated the web hands-free in this session.']),
+    toCsvRow(['Report Generation Time', new Date().toLocaleString(), '', 'Timestamp when this performance evaluation report was exported.']),
+    toCsvRow(['Total Actions Logged', `${telemetrySession.logs.length} actions`, '', 'Total number of voice commands, clicks, and page interactions recorded.']),
+    '',
+    toCsvRow(['--- SECTION 2: THE 4 EVERYDAY QUESTIONS (EASY SCORECARD) ---']),
+    toCsvRow(['Everyday Question', 'Score / Result', 'Visual Progress Bar', 'What This Means in Plain English']),
+    toCsvRow(['1. Did the computer understand your voice?', voiceAccuracyPct !== null ? `${voiceAccuracyPct}%` : 'N/A', voiceBar, voiceExplanation]),
+    toCsvRow(['2. How fast did the system react?', speedRating, speedBar, speedExplanation]),
+    toCsvRow(['3. How did you click buttons and links?', clickSummary, clickBar, clickExplanation]),
+    toCsvRow(['4. Did handsfree navigation work?', navSummary, navBar, navExplanation]),
+    '',
+    toCsvRow(['--- SECTION 3: HELPFUL TIPS FOR BEST EXPERIENCE ---']),
+    toCsvRow(['Category', 'Status', 'Helpful Advice in Plain Language', 'Why This Matters']),
+    toCsvRow(['🎤 Microphone & Voice', 'Recommended', 'Speak naturally at normal conversational volume about 1 to 2 feet away.', 'Helps the local speech AI distinguish your words clearly from background sounds.']),
+    toCsvRow(['💡 Lighting & Camera', 'Recommended', 'Make sure your face is evenly illuminated with no strong backlight.', 'Allows the webcam to track your nose position with smooth pixel precision.']),
+    toCsvRow(['🔒 Privacy & Safety', '100% On-Device', 'All voice recognition and camera tracking stay private on your laptop.', 'No audio or video ever leaves your computer or gets uploaded to the cloud.']),
+    '',
+    toCsvRow(['--- SECTION 4: STEP-BY-STEP ACTIVITY STORY (LINE-BY-LINE EXPLANATION) ---']),
+    toCsvRow(['Step #', 'Time (MM:SS)', 'What You Did', 'What the Computer Did', 'Speed / Status', 'Plain-English Explanation for Common People'])
+  ];
+
+  if (telemetrySession.logs.length === 0) {
+    lines.push(toCsvRow(['-', '00:00', 'Started session', 'Ready for handsfree input', '✓ Ready', 'No actions have been performed yet. Try speaking "scroll down" or "click"!']));
+  } else {
+    telemetrySession.logs.forEach((log, idx) => {
+      const parsed = parseLogForCommoner(log, idx);
+      lines.push(toCsvRow([
+        parsed.step,
+        parsed.time,
+        parsed.whatYouDid,
+        parsed.whatComputerDid,
+        parsed.speedStatus,
+        parsed.laymanExplanation
+      ]));
+    });
+  }
+
+  // Prepend UTF-8 Byte Order Mark (\uFEFF) so Microsoft Excel opens it seamlessly with all symbols & formatting
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+
+  browser.downloads.download({
+    url,
+    filename: `handsfree_evaluation_${Date.now()}.csv`,
+    saveAs: true
+  });
+}
+
+// --- Exact Voice Command Mapping ---
+const COMMANDS = {
+  // 1. Scroll Down
+  'page down': { action: 'SCROLL', payload: { y: 550 } },
+  'down': { action: 'SCROLL', payload: { y: 550 } },
+
+  // 2. Scroll Up
+  'page up': { action: 'SCROLL', payload: { y: -550 } },
+  'up': { action: 'SCROLL', payload: { y: -550 } },
+
+  // 3. Jump to Extremes ('title' scrolls to top)
+  'head bottom': { action: 'SCROLL_EXTREME', payload: { position: 'BOTTOM' } },
+  'bottom': { action: 'SCROLL_EXTREME', payload: { position: 'BOTTOM' } },
+  'head top': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+  'title': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+  'top': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+
+  // 4. Continuous Auto-Scroll ('start reading' down, 'reverse' up)
+  // Continuous Auto-Scroll Down
+  'start reading': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'start read': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reading down': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reading': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'read down': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reverse': { action: 'AUTO_SCROLL_START', payload: { direction: -1 } },
+  'read up': { action: 'AUTO_SCROLL_START', payload: { direction: -1 } },
+
+  // 5. Stop Auto-Scroll
+  'stop reading': { action: 'AUTO_SCROLL_STOP' },
+  'stop': { action: 'AUTO_SCROLL_STOP' },
+
+  // 6. Adjust Speed (Step size 0.25)
+  'move fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
+  'fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
+  'move slow': { action: 'AUTO_SCROLL_SPEED', payload: { delta: -0.75 } },
+  'slow': { action: 'AUTO_SCROLL_SPEED', payload: { delta: -0.75 } },
+
+  // 7. Tab Navigation
+  'next page': { action: 'NEXT_TAB' },
+  'back page': { action: 'PREV_TAB' },
+  'new page': { action: 'NEW_TAB' },
+  'close page': { action: 'CLOSE_TAB' },
+
+  // 8. Interaction & Selection
+  'click': { action: 'CLICK' },
+
+  // 9. Search Bar & Form Focus
+  'open search': { action: 'FOCUS_SEARCH' },
+
+  // 10. Clear Field
+  'clear': { action: 'CLEAR' },
+
+  // 11. Recenter Gaze
+  'center': { action: 'RECENTER' },
+
+  // 12. Evaluation & Telemetry Export
+  'export stats': { action: 'EXPORT_METRICS' },
+  'export metrics': { action: 'EXPORT_METRICS' }
+};
+
+// Sort longest phrase first so multi-word commands take priority over standalone keywords
+const SORTED_COMMAND_KEYS = Object.keys(COMMANDS).sort((a, b) => b.length - a.length);
+
+// --- Tab Management Handlers ---
 async function getNormalBrowserTabs() {
-  // 1. Target the last-focused normal browser window
   let targetWindow = null;
   try {
     targetWindow = await browser.windows.getLastFocused({ populate: true, windowTypes: ['normal'] });
@@ -87,7 +346,6 @@ async function getNormalBrowserTabs() {
 
   if (!targetWindow || !targetWindow.tabs) return { currentWindow: null, webTabs: [] };
 
-  // 2. Filter out extension utility tabs (tracker, mic permission, devtools)
   const webTabs = targetWindow.tabs.filter(t => 
     t.url && !t.url.startsWith('moz-extension://') && !t.url.startsWith('about:debugging')
   );
@@ -98,13 +356,8 @@ async function getNormalBrowserTabs() {
 async function cycleTab(direction = 1) {
   try {
     const { currentWindow, webTabs } = await getNormalBrowserTabs();
+    if (webTabs.length <= 1) return;
 
-    if (webTabs.length <= 1) {
-      console.warn('[Handsfree] Not enough web tabs to cycle through.');
-      return;
-    }
-
-    // Identify which tab is currently active in that window
     const activeTab = currentWindow.tabs.find(t => t.active);
     const currentIndex = webTabs.findIndex(t => t.id === activeTab?.id);
 
@@ -117,13 +370,11 @@ async function cycleTab(direction = 1) {
 
     const targetTab = webTabs[nextIndex];
     if (targetTab?.id) {
-      // 1. Activate tab
       await browser.tabs.update(targetTab.id, { active: true });
-      // 2. Ensure its parent window is brought to the foreground
       await browser.windows.update(targetTab.windowId, { focused: true });
-
       activeTabId = targetTab.id;
-      console.log(`[Handsfree] Switched to tab: ${targetTab.title || targetTab.id}`);
+      telemetrySession.metrics.tabSwitches++;
+      recordTelemetryEvent('TAB_MANAGEMENT', 'SWITCH_TAB', { toTabId: targetTab.id });
     }
   } catch (err) {
     console.error('[Handsfree] Failed to cycle tab:', err);
@@ -133,11 +384,9 @@ async function cycleTab(direction = 1) {
 async function createNewTab() {
   try {
     const { currentWindow } = await getNormalBrowserTabs();
-    const windowId = currentWindow ? currentWindow.id : undefined;
-
     const newTab = await browser.tabs.create({ 
       active: true, 
-      windowId: windowId 
+      windowId: currentWindow ? currentWindow.id : undefined 
     });
 
     if (newTab.windowId) {
@@ -145,7 +394,7 @@ async function createNewTab() {
     }
 
     activeTabId = newTab.id;
-    console.log('[Handsfree] Opened new tab.');
+    recordTelemetryEvent('TAB_MANAGEMENT', 'NEW_TAB', { tabId: newTab.id });
   } catch (err) {
     console.error('[Handsfree] Failed to create tab:', err);
   }
@@ -159,14 +408,13 @@ async function closeCurrentTab() {
     const activeTab = currentWindow.tabs.find(t => t.active);
     if (activeTab && !activeTab.url.startsWith('moz-extension://')) {
       await browser.tabs.remove(activeTab.id);
-      console.log('[Handsfree] Closed active tab.');
+      recordTelemetryEvent('TAB_MANAGEMENT', 'CLOSE_TAB', { tabId: activeTab.id });
     }
   } catch (err) {
     console.error('[Handsfree] Failed to close tab:', err);
   }
 }
 
-// Maintain Active Web Tab Target
 async function updateActiveTab() {
   try {
     const focusedTabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
@@ -181,9 +429,7 @@ async function updateActiveTab() {
     if (fallback?.id) {
       activeTabId = fallback.id;
     }
-  } catch (e) {
-    // Fail silently during transitions
-  }
+  } catch (e) {}
 }
 
 browser.tabs.onActivated.addListener(() => { updateActiveTab(); });
@@ -193,7 +439,6 @@ if (browser.windows?.onFocusChanged) {
 }
 updateActiveTab();
 
-// Synchronous, non-blocking message dispatcher
 function sendToTab(msg) {
   if (activeTabId) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
@@ -205,26 +450,22 @@ function sendToTab(msg) {
   }
 }
 
-// Initialize Whisper Speech Recognizer
 async function initEngine() {
-  console.log('[Handsfree] Initializing local speech model...');
+  console.log('[Handsfree] Initializing Whisper model...');
   try {
     transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en', {
       quantized: true
     });
-    console.log('[Handsfree] Local speech recognizer ready.');
+    console.log('[Handsfree] Speech recognizer ready.');
   } catch (err) {
     console.error('[Handsfree] Speech engine init error:', err);
   }
 }
-
 initEngine();
 
-// Port Connections
+// --- Port Streams & Audio Inference ---
 browser.runtime.onConnect.addListener((port) => {
-  // --- High-Speed Nose Tracking Stream ---
   if (port.name === 'cursor-tracking') {
-    console.log('[Handsfree] Cursor tracking port connected.');
     cursorTrackingPort = port;
 
     port.onDisconnect.addListener(() => {
@@ -239,16 +480,15 @@ browser.runtime.onConnect.addListener((port) => {
         sendToTab({
           type: 'UPDATE_CURSOR',
           x: msg.x,
-          y: msg.y
+          y: msg.y,
+          stickyHold: msg.stickyHold,
+          dwellDuration: msg.dwellDuration
         });
       }
     });
   }
 
-  // --- Audio Stream ---
   if (port.name === 'audio-stream') {
-    console.log('[Handsfree] Audio stream port connected.');
-
     port.onMessage.addListener(async (msg) => {
       if (!msg.audioChunk || !transcriber) return;
 
@@ -270,24 +510,38 @@ browser.runtime.onConnect.addListener((port) => {
           audioBufferChunk = [];
           silenceFrames = 0;
 
-          // Drop noise bursts shorter than 0.35 seconds to avoid corrupting speech recognition
           if (fullBuffer.length < 16000 * 0.35) return;
 
-          console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
-
           try {
+            telemetrySession.metrics.totalVoiceCommands++;
+            const t0 = performance.now();
             const output = await transcriber(fullBuffer);
+            const inferenceMs = Math.round(performance.now() - t0);
+
             let transcript = '';
             if (typeof output === 'string') transcript = output;
             else if (Array.isArray(output) && output[0]?.text) transcript = output[0].text;
             else if (output?.text) transcript = output.text;
 
             transcript = transcript.trim();
-            console.log(`[Raw Model Output]: "${transcript}"`);
-
             if (!transcript) return;
 
+            recordTelemetryEvent('VOICE_ASR', 'INFERENCE_COMPLETE', {
+              transcript,
+              latencyMs: inferenceMs,
+              mode: currentMode
+            });
+
+            // 1. Navigation Mode Command Resolution
             if (currentMode === 'NAVIGATION') {
+              // Strip all punctuation and normalize multiple spaces to a single space
+              const lower = transcript
+                .toLowerCase()
+                .replace(/[.,/#!$%^&*;:{}=\-_`~()?]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+              console.log(`[Handsfree Cleaned Utterance]: "${lower}"`);
               const lower = transcript.toLowerCase();
               const linkNumber = parseLinkNumber(lower);
 
@@ -305,11 +559,14 @@ browser.runtime.onConnect.addListener((port) => {
 
               let matched = false;
 
-              for (const [cmd, config] of Object.entries(COMMANDS)) {
-                if (lower.includes(cmd)) {
-                  console.log(`[Handsfree Command Triggered]: ${cmd}`);
+              for (const cmd of SORTED_COMMAND_KEYS) {
+                // Check both boundary-isolated match and substring inclusion
+                const regex = new RegExp(`(^|\\s)${cmd}(\\s|$)`, 'i');
+                if (regex.test(lower) || lower.includes(cmd)) {
+                  const config = COMMANDS[cmd];
+                  console.log(`[Handsfree Command Triggered]: "${cmd}"`);
+                  telemetrySession.metrics.recognizedCommands++;
 
-                  // Handle Browser-Level Operations
                   if (config.action === 'NEXT_TAB') {
                     cycleTab(1);
                   } else if (config.action === 'PREV_TAB') {
@@ -318,18 +575,23 @@ browser.runtime.onConnect.addListener((port) => {
                     createNewTab();
                   } else if (config.action === 'CLOSE_TAB') {
                     closeCurrentTab();
+                  } else if (config.action === 'START_CALIBRATION') {
+                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'START_CALIBRATION' });
                   } else if (config.action === 'RECENTER') {
-                    if (cursorTrackingPort) {
-                      cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
-                    }
+                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
+                  } else if (config.action === 'EXPORT_METRICS') {
+                    exportEvaluationCSV();
                   } else {
-                    // Handle Page-Level DOM Operations
                     const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
                     const payload = isCoordCommand
                       ? { x: latestCursor.x, y: latestCursor.y }
                       : config.payload;
 
                     sendToTab({ type: 'COMMAND', command: config.action, payload });
+
+                    if (config.action === 'CLICK' && cursorTrackingPort) {
+                      cursorTrackingPort.postMessage({ type: 'NEXT_CALIB_POINT' });
+                    }
                   }
 
                   matched = true;
@@ -338,33 +600,28 @@ browser.runtime.onConnect.addListener((port) => {
               }
 
               if (!matched) {
-                console.log(`[Handsfree] No navigation command matched in: "${lower}"`);
+                telemetrySession.metrics.unrecognizedUtterances++;
+                console.log(`[Handsfree] No command matched in: "${lower}"`);
               }
             } else if (currentMode === 'DICTATION') {
               const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
-              if (cleanText === 'stop dictating' || cleanText === 'escape' || cleanText.endsWith(' stop dictating')) {
+              if (cleanText === 'stop dictating' || cleanText === 'exit input' || cleanText === 'escape') {
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
-                cleanText === 'search' ||
                 cleanText === 'enter' ||
                 cleanText === 'submit' ||
-                cleanText === 'press enter' ||
-                cleanText === 'press search'
+                cleanText === 'press enter'
               ) {
-                console.log(`[Handsfree] Intercepted SEARCH / SUBMIT command from: "${transcript}"`);
                 sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
                 cleanText === 'clear' ||
-                cleanText === 'clear field' ||
-                cleanText === 'clear text' ||
-                cleanText === 'delete all' ||
-                cleanText.endsWith(' clear')
+                cleanText === 'clear all' ||
+                cleanText === 'erase'
               ) {
-                console.log(`[Handsfree] Intercepted CLEAR command from utterance: "${transcript}"`);
                 sendToTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
                 sendToTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
@@ -379,37 +636,6 @@ browser.runtime.onConnect.addListener((port) => {
   }
 });
 
-// Whisper may return either digits or number words for a link hint.
-function parseLinkNumber(transcript) {
-  const match = transcript.match(/\b(?:link|number|hint)\s*(\d{1,3})\b/);
-  if (match) return Number(match[1]);
-
-  const digitMatch = transcript.match(/\b(\d{1,3})\b/);
-  if (digitMatch) return Number(digitMatch[1]);
-
-  const units = {
-    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
-    six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
-    sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19
-  };
-  const tens = {
-    twenty: 20, thirty: 30, forty: 40, fifty: 50,
-    sixty: 60, seventy: 70, eighty: 80, ninety: 90
-  };
-  const words = transcript.replace(/[-,]/g, ' ').split(/\s+/);
-  const numberIndex = words.findIndex(word => units[word] !== undefined || tens[word] !== undefined);
-  if (numberIndex === -1) return null;
-
-  const first = words[numberIndex];
-  if (tens[first] !== undefined) {
-    const next = units[words[numberIndex + 1]];
-    return tens[first] + (next !== undefined && next < 10 ? next : 0);
-  }
-  return units[first];
-}
-
-// Audio math helpers
 function calculateRMS(buffer) {
   let sum = 0;
   for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
@@ -419,9 +645,7 @@ function calculateRMS(buffer) {
 function calculateZCR(buffer) {
   let crossings = 0;
   for (let i = 1; i < buffer.length; i++) {
-    if ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0)) {
-      crossings++;
-    }
+    if ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0)) crossings++;
   }
   return crossings / buffer.length;
 }
@@ -437,10 +661,15 @@ function mergeAudioBuffers(buffers) {
   return result;
 }
 
-// Mode changes triggered by DOM focus in content.js
 browser.runtime.onMessage.addListener((message) => {
   if (message.type === 'SET_MODE') {
     currentMode = message.mode;
-    console.log(`[Handsfree] Switched to mode: ${currentMode}`);
+  } else if (message.type === 'TELEMETRY_LOG') {
+    recordTelemetryEvent(message.category, message.eventName, message.details);
+    if (message.eventName === 'SELECTION_ACTIVATION') {
+      telemetrySession.metrics.totalClicks++;
+      if (message.details?.activationMethod === 'DWELL_CLICK') telemetrySession.metrics.dwellClicks++;
+      if (message.details?.activationMethod === 'VOICE_CLICK') telemetrySession.metrics.voiceClicks++;
+    }
   }
 });

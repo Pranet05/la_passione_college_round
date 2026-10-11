@@ -1,9 +1,10 @@
-// content.js - Virtual Pointer Overlay, DOM Actions & Dictation Engine
+// content.js - Virtual Pointer Overlay, DOM Actions, Auto-Scroll Engine & Evaluation Telemetry
 
 // --- 1. Mount Hardware-Accelerated Virtual Cursor with Sticky Hold Ring ---
 let cursorEl = document.getElementById('handsfree-virtual-pointer');
 let holdRingProgress = null;
 let pointerDot = null;
+let scrollHudEl = null;
 
 if (!cursorEl) {
   cursorEl = document.createElement('div');
@@ -41,13 +42,38 @@ if (!cursorEl) {
     "></div>
   `;
 
+  // HUD badge for Auto-Scroll speed & state indication
+  scrollHudEl = document.createElement('div');
+  scrollHudEl.id = 'handsfree-scroll-hud';
+  Object.assign(scrollHudEl.style, {
+    position: 'fixed',
+    bottom: '24px',
+    right: '24px',
+    padding: '8px 14px',
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    color: '#38bdf8',
+    border: '1.5px solid #0284c7',
+    borderRadius: '20px',
+    fontSize: '13px',
+    fontWeight: '600',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+    pointerEvents: 'none',
+    zIndex: '2147483647',
+    display: 'none',
+    backdropFilter: 'blur(4px)'
+  });
+
   const mount = () => {
-    if (!document.getElementById('handsfree-virtual-pointer')) {
-      const parent = document.body || document.documentElement;
-      if (parent) {
+    const parent = document.body || document.documentElement;
+    if (parent) {
+      if (!document.getElementById('handsfree-virtual-pointer')) {
         parent.appendChild(cursorEl);
         holdRingProgress = document.getElementById('handsfree-hold-progress');
         pointerDot = document.getElementById('handsfree-pointer-dot');
+      }
+      if (!document.getElementById('handsfree-scroll-hud')) {
+        parent.appendChild(scrollHudEl);
       }
     }
   };
@@ -78,6 +104,15 @@ let dwellCooldownUntil = 0;
 let isHoldingDrag = false;
 let holdDragTarget = null;
 
+// Auto-Scroll State Engine (Crawl starts at 0.25 px/frame)
+let isAutoScrolling = false;
+let autoScrollSpeed = 0.75;
+let autoScrollDirection = 1; // 1 = down, -1 = up
+let autoScrollRafId = null;
+
+// Telemetry & Task Evaluation Timers
+let taskStartTime = performance.now();
+let lastTargetHoverTime = performance.now();
 // Link hint overlay state. Hints are viewport-relative and are rebuilt after
 // scrolling so their numbers always match what is currently visible.
 let linkHintOverlay = null;
@@ -91,6 +126,12 @@ document.addEventListener('mousemove', (e) => {
   lastHoveredElement = e.target;
 }, { passive: true });
 
+// Stop continuous scrolling on manual user interaction
+window.addEventListener('wheel', () => {
+  if (isAutoScrolling) stopAutoScroll();
+}, { passive: true });
+
+// --- 2. Focus Monitoring for Mode Switching & Highlight Styling ---
 function getVisibleLinks() {
   return Array.from(document.querySelectorAll('a[href]')).filter((link) => {
     if (link.closest('#handsfree-link-hints')) return false;
@@ -224,7 +265,6 @@ function isTextInput(el) {
   );
 }
 
-// Visual highlight badge for Handsfree active text field
 function applyFieldHighlight(el) {
   if (!el) return;
   el.style.outline = '3px solid #38bdf8';
@@ -254,7 +294,7 @@ document.addEventListener('focusout', (e) => {
   }
 });
 
-// Helper: Find closest scrollable ancestor
+// Helper: Locate closest scrollable container
 function findScrollableElement(startX, startY) {
   let el = document.elementFromPoint(startX, startY);
   while (el && el !== document.body && el !== document.documentElement) {
@@ -276,7 +316,7 @@ function getClickableAt(x, y) {
   return el.closest('a, button, [role="button"], input, select, textarea, [tabindex], label');
 }
 
-// --- 3. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
+// --- 3. Cursor Loop with Sticky Target Snapping ---
 function updateCursorRender() {
   rafScheduled = false;
 
@@ -332,7 +372,7 @@ function checkStickyDwellHold(clickable) {
       }
 
       if (progress >= 1.0) {
-        triggerClick(currentScreenX, currentScreenY, clickable);
+        triggerClick(currentScreenX, currentScreenY, clickable, 'DWELL_CLICK');
         dwellCooldownUntil = now + 900;
         resetDwellRing();
 
@@ -352,6 +392,7 @@ function checkStickyDwellHold(clickable) {
       dwellStartTime = now;
       dwellAnchorX = currentScreenX;
       dwellAnchorY = currentScreenY;
+      lastTargetHoverTime = now;
       if (holdRingProgress) {
         holdRingProgress.style.strokeDashoffset = '87.96';
       }
@@ -369,7 +410,62 @@ function resetDwellRing() {
   }
 }
 
-// --- 5. Message Listener ---
+// --- 5. Continuous Smooth Auto-Scroll Loop ---
+function startAutoScroll(direction = 1) {
+  autoScrollDirection = direction;
+  autoScrollSpeed = 0.25; // Always resets to slow reading crawl on activation
+  isAutoScrolling = true;
+  updateScrollHud();
+
+  if (autoScrollRafId) cancelAnimationFrame(autoScrollRafId);
+
+  const scrollStep = () => {
+    if (!isAutoScrolling) return;
+
+    const scrollTarget = findScrollableElement(currentScreenX, currentScreenY);
+    const delta = autoScrollDirection * autoScrollSpeed;
+
+    if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
+      scrollTarget.scrollBy({ top: delta, behavior: 'auto' });
+    } else {
+      window.scrollBy({ top: delta, behavior: 'auto' });
+    }
+
+    autoScrollRafId = requestAnimationFrame(scrollStep);
+  };
+
+  autoScrollRafId = requestAnimationFrame(scrollStep);
+}
+
+function stopAutoScroll() {
+  isAutoScrolling = false;
+  if (autoScrollRafId) {
+    cancelAnimationFrame(autoScrollRafId);
+    autoScrollRafId = null;
+  }
+  if (scrollHudEl) {
+    scrollHudEl.style.display = 'none';
+  }
+}
+
+function adjustAutoScrollSpeed(delta) {
+  if (!isAutoScrolling) {
+    startAutoScroll(1);
+    return;
+  }
+  // Clamp speed from 0.25 px/frame to 8.0 px/frame in precise 0.25 increments
+  autoScrollSpeed = Math.max(0.25, Math.min(8.0, Number((autoScrollSpeed + delta).toFixed(2))));
+  updateScrollHud();
+}
+
+function updateScrollHud() {
+  if (!scrollHudEl) return;
+  const dirIcon = autoScrollDirection > 0 ? '⬇' : '⬆';
+  scrollHudEl.innerText = `${dirIcon} Auto-Scrolling (${autoScrollSpeed.toFixed(2)}x speed)`;
+  scrollHudEl.style.display = 'block';
+}
+
+// --- 6. Message Listener ---
 browser.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'UPDATE_CURSOR') {
     targetScreenX = msg.x * window.innerWidth;
@@ -396,7 +492,7 @@ browser.runtime.onMessage.addListener((msg) => {
   }
 });
 
-// --- 6. Command Execution & Search Highlighting ---
+// --- 7. Command Execution ---
 function handleNavigationCommand(command, payload) {
   switch (command) {
     case 'OPEN_LINK_OVERLAY': {
@@ -405,6 +501,7 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'SCROLL': {
+      stopAutoScroll();
       const scrollTarget = findScrollableElement(currentScreenX, currentScreenY);
       if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
         scrollTarget.scrollBy({ top: payload.y, behavior: 'smooth' });
@@ -414,37 +511,77 @@ function handleNavigationCommand(command, payload) {
       break;
     }
 
+    case 'SCROLL_EXTREME': {
+      stopAutoScroll();
+      const targetPos = payload.position;
+      const scrollTarget = findScrollableElement(currentScreenX, currentScreenY);
+
+      if (targetPos === 'BOTTOM') {
+        const maxScroll = Math.max(
+          document.body.scrollHeight,
+          document.documentElement.scrollHeight,
+          scrollTarget.scrollHeight || 0
+        );
+
+        if (scrollTarget && typeof scrollTarget.scrollTo === 'function') {
+          scrollTarget.scrollTo({ top: scrollTarget.scrollHeight, behavior: 'smooth' });
+        }
+        window.scrollTo({ top: maxScroll, behavior: 'smooth' });
+      } else if (targetPos === 'TOP') {
+        if (scrollTarget && typeof scrollTarget.scrollTo === 'function') {
+          scrollTarget.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+      break;
+    }
+
+    case 'AUTO_SCROLL_START': {
+      startAutoScroll(payload?.direction || 1);
+      break;
+    }
+
+    case 'AUTO_SCROLL_SPEED': {
+      adjustAutoScrollSpeed(payload?.delta || 0.25);
+      break;
+    }
+
+    case 'AUTO_SCROLL_STOP': {
+      stopAutoScroll();
+      break;
+    }
+
     case 'SUBMIT_SEARCH': {
+      stopAutoScroll();
       const el = document.activeElement;
       if (!el) return;
 
       removeFieldHighlight(el);
+      const taskElapsed = Math.round(performance.now() - taskStartTime);
+
+      browser.runtime.sendMessage({
+        type: 'TELEMETRY_LOG',
+        category: 'TASK_COMPLETION',
+        eventName: 'SEARCH_SUBMITTED',
+        details: { taskCompletionTimeMs: taskElapsed }
+      });
 
       const enterOptions = {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true,
-        view: window
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, view: window
       };
-
       el.dispatchEvent(new KeyboardEvent('keydown', enterOptions));
       el.dispatchEvent(new KeyboardEvent('keypress', enterOptions));
       el.dispatchEvent(new KeyboardEvent('keyup', enterOptions));
 
-      if (el.form && typeof el.form.requestSubmit === 'function') {
-        el.form.requestSubmit();
-      } else if (el.form && typeof el.form.submit === 'function') {
-        el.form.submit();
-      }
+      if (el.form && typeof el.form.requestSubmit === 'function') el.form.requestSubmit();
+      else if (el.form && typeof el.form.submit === 'function') el.form.submit();
 
       el.blur();
       break;
     }
 
     case 'CLICK': {
+      stopAutoScroll();
       if (selectedLinkHint?.element?.isConnected) {
         const target = selectedLinkHint.element;
         selectedLinkHint = null;
@@ -457,7 +594,7 @@ function handleNavigationCommand(command, payload) {
       }
       const clickX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const clickY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
-      triggerClick(clickX, clickY);
+      triggerClick(clickX, clickY, null, 'VOICE_CLICK');
       break;
     }
 
@@ -467,6 +604,7 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'HOLD': {
+      stopAutoScroll();
       const holdX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const holdY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
 
@@ -485,14 +623,7 @@ function handleNavigationCommand(command, payload) {
         pointerDot.style.transform = 'scale(1.4)';
       }
 
-      const mouseInit = {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: holdX,
-        clientY: holdY
-      };
-
+      const mouseInit = { bubbles: true, cancelable: true, view: window, clientX: holdX, clientY: holdY };
       const createEvent = (evtType) => {
         if (typeof PointerEvent !== 'undefined' && evtType.startsWith('pointer')) {
           return new PointerEvent(evtType, { ...mouseInit, pointerId: 1, pointerType: 'mouse', isPrimary: true });
@@ -515,14 +646,7 @@ function handleNavigationCommand(command, payload) {
       if (cursorEl) cursorEl.style.display = 'flex';
 
       const releaseTarget = holdDragTarget || target || document.body;
-
-      const mouseInit = {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: relX,
-        clientY: relY
-      };
+      const mouseInit = { bubbles: true, cancelable: true, view: window, clientX: relX, clientY: relY };
 
       const createEvent = (evtType) => {
         if (typeof PointerEvent !== 'undefined' && evtType.startsWith('pointer')) {
@@ -547,7 +671,8 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'FOCUS_SEARCH': {
-      // Prioritized selectors covering Wikipedia (Vector & legacy), YouTube, Google, and standard HTML5 inputs
+      stopAutoScroll();
+      taskStartTime = performance.now();
       const selectors = [
         '#searchInput',
         '.cdx-text-input__input',
@@ -565,7 +690,6 @@ function handleNavigationCommand(command, payload) {
 
       let targetInput = null;
 
-      // 1. Locate the first matching, visible text field
       for (const sel of selectors) {
         const matches = document.querySelectorAll(sel);
         for (const el of matches) {
@@ -578,7 +702,6 @@ function handleNavigationCommand(command, payload) {
         if (targetInput) break;
       }
 
-      // 2. If the actual input is hidden behind an expandable button (e.g. mobile/responsive bars)
       if (!targetInput) {
         const triggerBtn = document.querySelector('button[aria-label*="search" i], [role="button"][aria-label*="search" i]');
         if (triggerBtn) {
@@ -591,12 +714,10 @@ function handleNavigationCommand(command, payload) {
       }
 
       if (targetInput) {
-        // Bring into view smoothly if tucked at top
         if (typeof targetInput.scrollIntoView === 'function') {
           targetInput.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
 
-        // Snap the red virtual cursor to the input center
         const rect = targetInput.getBoundingClientRect();
         targetScreenX = rect.left + rect.width / 2;
         targetScreenY = rect.top + rect.height / 2;
@@ -606,7 +727,6 @@ function handleNavigationCommand(command, payload) {
           cursorEl.style.transform = `translate3d(${currentScreenX - 18}px, ${currentScreenY - 18}px, 0)`;
         }
 
-        // Full activation sequence: Click -> Focus -> Select All
         const mouseEvt = { bubbles: true, cancelable: true, view: window };
         targetInput.dispatchEvent(new MouseEvent('mousedown', mouseEvt));
         targetInput.dispatchEvent(new MouseEvent('mouseup', mouseEvt));
@@ -617,10 +737,7 @@ function handleNavigationCommand(command, payload) {
           targetInput.select();
         }
 
-        // Apply high-visibility blue glow highlight
         applyFieldHighlight(targetInput);
-
-        // Tell background.js to enter DICTATION mode immediately
         browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'DICTATION' });
       } else {
         console.warn('[Handsfree] No search input found on this page.');
@@ -664,8 +781,8 @@ function handleNavigationCommand(command, payload) {
   }
 }
 
-// Reusable click performer
-function triggerClick(clickX, clickY, knownTarget = null) {
+// Reusable click performer with telemetry logging
+function triggerClick(clickX, clickY, knownTarget = null, activationMethod = 'VOICE_CLICK') {
   if (cursorEl) cursorEl.style.display = 'none';
   let target = knownTarget || document.elementFromPoint(clickX, clickY);
   if (cursorEl) cursorEl.style.display = 'flex';
@@ -679,6 +796,20 @@ function triggerClick(clickX, clickY, knownTarget = null) {
   if (!target) return;
 
   const clickable = target.closest('a, button, [role="button"], input, select, textarea, [tabindex], label') || target;
+  const isInteractive = Boolean(clickable && clickable !== document.body && clickable !== document.documentElement);
+  const acquisitionTimeMs = Math.round(performance.now() - lastTargetHoverTime);
+
+  browser.runtime.sendMessage({
+    type: 'TELEMETRY_LOG',
+    category: 'DOM_INTERACTION',
+    eventName: 'SELECTION_ACTIVATION',
+    details: {
+      activationMethod,
+      tagName: clickable.tagName,
+      isInteractiveTarget: isInteractive,
+      acquisitionTimeMs
+    }
+  });
 
   if (pointerDot) {
     pointerDot.style.transform = 'scale(1.6)';
@@ -727,7 +858,7 @@ function triggerClick(clickX, clickY, knownTarget = null) {
   }
 }
 
-// --- 7. Dictation Text Injection ---
+// --- 8. Dictation Text Injection ---
 function injectTextIntoActiveElement(text) {
   const el = document.activeElement;
   if (!el || !isTextInput(el)) return;
