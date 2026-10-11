@@ -272,59 +272,70 @@ function exportEvaluationCSV() {
   });
 }
 
+// --- Exact Voice Command Mapping ---
 const COMMANDS = {
-  // Navigation scrolling
-  'scroll down': { action: 'SCROLL', payload: { y: 600 } },
-  'scroll up': { action: 'SCROLL', payload: { y: -600 } },
-  'down': { action: 'SCROLL', payload: { y: 350 } },
-  'up': { action: 'SCROLL', payload: { y: -350 } },
-  'page down': { action: 'SCROLL', payload: { y: 600 } },
-  'page up': { action: 'SCROLL', payload: { y: -600 } },
+  // 1. Scroll Down
+  'page down': { action: 'SCROLL', payload: { y: 550 } },
+  'down': { action: 'SCROLL', payload: { y: 550 } },
 
-  // Tab switching commands
-  'next tab': { action: 'NEXT_TAB' },
-  'switch tab': { action: 'NEXT_TAB' },
-  'previous tab': { action: 'PREV_TAB' },
-  'prev tab': { action: 'PREV_TAB' },
-  'last tab': { action: 'PREV_TAB' },
-  'new tab': { action: 'NEW_TAB' },
-  'close tab': { action: 'CLOSE_TAB' },
+  // 2. Scroll Up
+  'page up': { action: 'SCROLL', payload: { y: -550 } },
+  'up': { action: 'SCROLL', payload: { y: -550 } },
 
-  // Click & phonetic variations
+  // 3. Jump to Extremes ('title' scrolls to top)
+  'head bottom': { action: 'SCROLL_EXTREME', payload: { position: 'BOTTOM' } },
+  'bottom': { action: 'SCROLL_EXTREME', payload: { position: 'BOTTOM' } },
+  'head top': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+  'title': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+  'top': { action: 'SCROLL_EXTREME', payload: { position: 'TOP' } },
+
+  // 4. Continuous Auto-Scroll ('start reading' down, 'reverse' up)
+  // Continuous Auto-Scroll Down
+  'start reading': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'start read': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reading down': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reading': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'read down': { action: 'AUTO_SCROLL_START', payload: { direction: 1 } },
+  'reverse': { action: 'AUTO_SCROLL_START', payload: { direction: -1 } },
+  'read up': { action: 'AUTO_SCROLL_START', payload: { direction: -1 } },
+
+  // 5. Stop Auto-Scroll
+  'stop reading': { action: 'AUTO_SCROLL_STOP' },
+  'stop': { action: 'AUTO_SCROLL_STOP' },
+
+  // 6. Adjust Speed (Step size 0.25)
+  'move fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
+  'fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
+  'move slow': { action: 'AUTO_SCROLL_SPEED', payload: { delta: -0.75 } },
+  'slow': { action: 'AUTO_SCROLL_SPEED', payload: { delta: -0.75 } },
+
+  // 7. Tab Navigation
+  'next page': { action: 'NEXT_TAB' },
+  'back page': { action: 'PREV_TAB' },
+  'new page': { action: 'NEW_TAB' },
+  'close page': { action: 'CLOSE_TAB' },
+
+  // 8. Interaction & Selection
   'click': { action: 'CLICK' },
-  'quick': { action: 'CLICK' },
-  'clique': { action: 'CLICK' },
-  'klick': { action: 'CLICK' },
-  'tap': { action: 'CLICK' },
-  'press': { action: 'CLICK' },
-  'select': { action: 'CLICK' },
 
-  // Sticky Hold & Release (Mouse Down / Drag / Drop)
-  'sticky hold': { action: 'HOLD' },
-  'hold': { action: 'HOLD' },
-  'grab': { action: 'HOLD' },
-  'release': { action: 'RELEASE' },
-  'drop': { action: 'RELEASE' },
-  'unhold': { action: 'RELEASE' },
+  // 9. Search Bar & Form Focus
+  'open search': { action: 'FOCUS_SEARCH' },
 
-  // Search input focus
-  'focus search': { action: 'FOCUS_SEARCH' },
-  'search': { action: 'FOCUS_SEARCH' },
-  'find': { action: 'FOCUS_SEARCH' },
+  // 10. Clear Field
+  'clear': { action: 'CLEAR' },
 
-  // Calibration & Telemetry triggers
-  'start calibration': { action: 'START_CALIBRATION' },
-  'calibrate': { action: 'START_CALIBRATION' },
-  'recenter': { action: 'RECENTER' },
+  // 11. Recenter Gaze
   'center': { action: 'RECENTER' },
-  'export metrics': { action: 'EXPORT_METRICS' },
-  'download stats': { action: 'EXPORT_METRICS' },
 
-  // Reset
-  'clear': { action: 'CLEAR' }
+  // 12. Evaluation & Telemetry Export
+  'export stats': { action: 'EXPORT_METRICS' },
+  'export metrics': { action: 'EXPORT_METRICS' }
 };
 
-// --- Reliable Multi-Window Tab Navigation Handlers ---
+// Sort longest phrase first so multi-word commands take priority over standalone keywords
+const SORTED_COMMAND_KEYS = Object.keys(COMMANDS).sort((a, b) => b.length - a.length);
+
+// --- Tab Management Handlers ---
 async function getNormalBrowserTabs() {
   let targetWindow = null;
   try {
@@ -452,6 +463,7 @@ async function initEngine() {
 }
 initEngine();
 
+// --- Port Streams & Audio Inference ---
 browser.runtime.onConnect.addListener((port) => {
   if (port.name === 'cursor-tracking') {
     cursorTrackingPort = port;
@@ -520,12 +532,24 @@ browser.runtime.onConnect.addListener((port) => {
               mode: currentMode
             });
 
+            // 1. Navigation Mode Command Resolution
             if (currentMode === 'NAVIGATION') {
-              const lower = transcript.toLowerCase();
+              // Strip all punctuation and normalize multiple spaces to a single space
+              const lower = transcript
+                .toLowerCase()
+                .replace(/[.,/#!$%^&*;:{}=\-_`~()?]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+              console.log(`[Handsfree Cleaned Utterance]: "${lower}"`);
               let matched = false;
 
-              for (const [cmd, config] of Object.entries(COMMANDS)) {
-                if (lower.includes(cmd)) {
+              for (const cmd of SORTED_COMMAND_KEYS) {
+                // Check both boundary-isolated match and substring inclusion
+                const regex = new RegExp(`(^|\\s)${cmd}(\\s|$)`, 'i');
+                if (regex.test(lower) || lower.includes(cmd)) {
+                  const config = COMMANDS[cmd];
+                  console.log(`[Handsfree Command Triggered]: "${cmd}"`);
                   telemetrySession.metrics.recognizedCommands++;
 
                   if (config.action === 'NEXT_TAB') {
@@ -562,29 +586,26 @@ browser.runtime.onConnect.addListener((port) => {
 
               if (!matched) {
                 telemetrySession.metrics.unrecognizedUtterances++;
+                console.log(`[Handsfree] No command matched in: "${lower}"`);
               }
             } else if (currentMode === 'DICTATION') {
               const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
-              if (cleanText === 'stop dictating' || cleanText === 'escape' || cleanText.endsWith(' stop dictating')) {
+              if (cleanText === 'stop dictating' || cleanText === 'exit input' || cleanText === 'escape') {
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
-                cleanText === 'search' ||
                 cleanText === 'enter' ||
                 cleanText === 'submit' ||
-                cleanText === 'press enter' ||
-                cleanText === 'press search'
+                cleanText === 'press enter'
               ) {
                 sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
                 cleanText === 'clear' ||
-                cleanText === 'clear field' ||
-                cleanText === 'clear text' ||
-                cleanText === 'delete all' ||
-                cleanText.endsWith(' clear')
+                cleanText === 'clear all' ||
+                cleanText === 'erase'
               ) {
                 sendToTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
