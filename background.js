@@ -22,6 +22,9 @@ const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
 
 const COMMANDS = {
+  // Link hint overlay
+  'open multi-link overlay': { action: 'OPEN_LINK_OVERLAY' },
+
   // Navigation scrolling
   'scroll down': { action: 'SCROLL', payload: { y: 600 } },
   'scroll up': { action: 'SCROLL', payload: { y: -600 } },
@@ -286,6 +289,20 @@ browser.runtime.onConnect.addListener((port) => {
 
             if (currentMode === 'NAVIGATION') {
               const lower = transcript.toLowerCase();
+              const linkNumber = parseLinkNumber(lower);
+
+              // Link hints are handled before the normal command table so
+              // utterances such as "click three" can still select hint 3.
+              if (linkNumber !== null) {
+                console.log(`[Handsfree] Link hint selected: ${linkNumber}`);
+                sendToTab({
+                  type: 'COMMAND',
+                  command: 'LINK_NUMBER',
+                  payload: { number: linkNumber }
+                });
+                return;
+              }
+
               let matched = false;
 
               for (const [cmd, config] of Object.entries(COMMANDS)) {
@@ -361,6 +378,36 @@ browser.runtime.onConnect.addListener((port) => {
     });
   }
 });
+
+// Whisper may return either digits or number words for a link hint.
+function parseLinkNumber(transcript) {
+  const match = transcript.match(/\b(?:link|number|hint)\s*(\d{1,3})\b/);
+  if (match) return Number(match[1]);
+
+  const digitMatch = transcript.match(/\b(\d{1,3})\b/);
+  if (digitMatch) return Number(digitMatch[1]);
+
+  const units = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+    six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+    sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19
+  };
+  const tens = {
+    twenty: 20, thirty: 30, forty: 40, fifty: 50,
+    sixty: 60, seventy: 70, eighty: 80, ninety: 90
+  };
+  const words = transcript.replace(/[-,]/g, ' ').split(/\s+/);
+  const numberIndex = words.findIndex(word => units[word] !== undefined || tens[word] !== undefined);
+  if (numberIndex === -1) return null;
+
+  const first = words[numberIndex];
+  if (tens[first] !== undefined) {
+    const next = units[words[numberIndex + 1]];
+    return tens[first] + (next !== undefined && next < 10 ? next : 0);
+  }
+  return units[first];
+}
 
 // Audio math helpers
 function calculateRMS(buffer) {

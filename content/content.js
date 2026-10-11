@@ -78,10 +78,137 @@ let dwellCooldownUntil = 0;
 let isHoldingDrag = false;
 let holdDragTarget = null;
 
+// Link hint overlay state. Hints are viewport-relative and are rebuilt after
+// scrolling so their numbers always match what is currently visible.
+let linkHintOverlay = null;
+let linkHintEntries = [];
+let selectedLinkHint = null;
+let linkHintRefreshTimer = null;
+let linkHintOverlayActive = false;
+
 // Track mouse position if physical mouse is used
 document.addEventListener('mousemove', (e) => {
   lastHoveredElement = e.target;
 }, { passive: true });
+
+function getVisibleLinks() {
+  return Array.from(document.querySelectorAll('a[href]')).filter((link) => {
+    if (link.closest('#handsfree-link-hints')) return false;
+    const rect = link.getBoundingClientRect();
+    const style = window.getComputedStyle(link);
+    return rect.width > 0 && rect.height > 0 &&
+      rect.bottom >= 0 && rect.right >= 0 &&
+      rect.top <= window.innerHeight && rect.left <= window.innerWidth &&
+      style.visibility !== 'hidden' && style.display !== 'none';
+  });
+}
+
+function ensureLinkHintOverlay() {
+  if (linkHintOverlay) return linkHintOverlay;
+  linkHintOverlay = document.createElement('div');
+  linkHintOverlay.id = 'handsfree-link-hints';
+  Object.assign(linkHintOverlay.style, {
+    position: 'fixed',
+    inset: '0',
+    pointerEvents: 'none',
+    zIndex: '2147483646',
+    fontFamily: 'Arial, sans-serif'
+  });
+  (document.body || document.documentElement).appendChild(linkHintOverlay);
+  return linkHintOverlay;
+}
+
+function refreshLinkHints() {
+  if (!linkHintOverlay || !linkHintOverlayActive) return;
+  const links = getVisibleLinks();
+  linkHintEntries = links.map((element, index) => ({ number: index + 1, element }));
+  linkHintOverlay.textContent = '';
+
+  linkHintEntries.forEach(({ number, element }) => {
+    const rect = element.getBoundingClientRect();
+    const badge = document.createElement('span');
+    badge.textContent = String(number);
+    badge.dataset.handsfreeHint = String(number);
+    Object.assign(badge.style, {
+      position: 'fixed',
+      left: `${Math.max(0, rect.left)}px`,
+      top: `${Math.max(0, rect.top)}px`,
+      minWidth: '22px',
+      height: '22px',
+      padding: '1px 5px',
+      boxSizing: 'border-box',
+      border: '2px solid #ffffff',
+      borderRadius: '5px',
+      background: selectedLinkHint?.number === number ? '#4f8f82' : '#6f8792',
+      color: '#f7fbfa',
+      fontSize: '14px',
+      fontWeight: '700',
+      lineHeight: '18px',
+      textAlign: 'center',
+      boxShadow: '0 1px 5px rgba(0, 0, 0, 0.75)'
+    });
+    linkHintOverlay.appendChild(badge);
+  });
+}
+
+function scheduleLinkHintRefresh() {
+  if (!linkHintOverlayActive || !linkHintOverlay || linkHintRefreshTimer) return;
+  linkHintRefreshTimer = setTimeout(() => {
+    linkHintRefreshTimer = null;
+    refreshLinkHints();
+  }, 80);
+}
+
+function updateLinkHintOverlay() {
+  if (!linkHintOverlayActive) return;
+  const links = getVisibleLinks();
+  ensureLinkHintOverlay();
+  refreshLinkHints();
+}
+
+function closeLinkHintOverlay() {
+  if (linkHintOverlay) {
+    linkHintOverlay.remove();
+    linkHintOverlay = null;
+  }
+  linkHintEntries = [];
+  selectedLinkHint = null;
+  linkHintOverlayActive = false;
+}
+
+function openLinkHintOverlay() {
+  linkHintOverlayActive = true;
+  updateLinkHintOverlay();
+}
+
+function selectLinkHint(number) {
+  if (!linkHintOverlay) updateLinkHintOverlay();
+  const entry = linkHintEntries.find(item => item.number === number);
+  if (!entry) {
+    console.warn(`[Handsfree] No visible link hint numbered ${number}.`);
+    return;
+  }
+
+  selectedLinkHint = entry;
+  entry.element.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+  refreshLinkHints();
+}
+
+window.addEventListener('scroll', scheduleLinkHintRefresh, { passive: true });
+window.addEventListener('resize', scheduleLinkHintRefresh, { passive: true });
+if (typeof MutationObserver !== 'undefined') {
+  const linkHintObserver = new MutationObserver((mutations) => {
+    // Rebuilding the overlay changes its own children; do not observe those
+    // changes or the refresh would continuously schedule itself.
+    if (mutations.some(mutation => !linkHintOverlay || !linkHintOverlay.contains(mutation.target))) {
+      scheduleLinkHintRefresh();
+    }
+  });
+  linkHintObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+}
 
 // --- 2. Focus Monitoring for Automatic Mode Switching & Highlight Styling ---
 function isTextInput(el) {
@@ -272,6 +399,11 @@ browser.runtime.onMessage.addListener((msg) => {
 // --- 6. Command Execution & Search Highlighting ---
 function handleNavigationCommand(command, payload) {
   switch (command) {
+    case 'OPEN_LINK_OVERLAY': {
+      openLinkHintOverlay();
+      break;
+    }
+
     case 'SCROLL': {
       const scrollTarget = findScrollableElement(currentScreenX, currentScreenY);
       if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
@@ -313,9 +445,24 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'CLICK': {
+      if (selectedLinkHint?.element?.isConnected) {
+        const target = selectedLinkHint.element;
+        selectedLinkHint = null;
+        const rect = target.getBoundingClientRect();
+        triggerClick(rect.left + rect.width / 2, rect.top + rect.height / 2, target);
+        if (linkHintOverlay) {
+          closeLinkHintOverlay();
+        }
+        break;
+      }
       const clickX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const clickY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
       triggerClick(clickX, clickY);
+      break;
+    }
+
+    case 'LINK_NUMBER': {
+      selectLinkHint(payload?.number);
       break;
     }
 
