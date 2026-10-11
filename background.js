@@ -42,9 +42,65 @@ function recordTelemetryEvent(category, eventName, details = {}) {
     ...details
   };
   telemetrySession.logs.push(entry);
+  sendTelemetrySummary();
 }
 
-// Helpers for human-friendly formatting in Excel
+function getTelemetryStatusData() {
+  const m = telemetrySession.metrics;
+  const totalDurationSec = Math.max(0, Math.round((performance.now() - telemetrySession.startTime) / 1000));
+  const durationFormatted = totalDurationSec >= 60
+    ? `${Math.floor(totalDurationSec / 60)}m ${String(totalDurationSec % 60).padStart(2, '0')}s`
+    : `${totalDurationSec}s`;
+
+  const asrLogs = telemetrySession.logs.filter(l => l.category === 'VOICE_ASR' && Number.isFinite(l.latencyMs));
+  const avgLatencyMs = asrLogs.length > 0
+    ? Math.round(asrLogs.reduce((acc, l) => acc + l.latencyMs, 0) / asrLogs.length)
+    : null;
+  const responseSpeed = avgLatencyMs !== null ? `${(avgLatencyMs / 1000).toFixed(2)}s` : 'Ready';
+
+  const recognizedCmds = m.recognizedCommands || 0;
+  const unrecognized = m.unrecognizedUtterances || 0;
+  const totalVoiceAttempts = recognizedCmds + unrecognized;
+  const usability = totalVoiceAttempts > 0
+    ? Math.round((recognizedCmds / totalVoiceAttempts) * 100)
+    : (asrLogs.length > 0 ? 100 : 100);
+
+  let tip = 'Speak commands like "down" or "click" to navigate';
+  if (totalVoiceAttempts > 0) {
+    if (usability < 60) {
+      tip = 'Move closer to mic to reduce ambient noise';
+    } else if (usability < 85) {
+      tip = 'Speak clearly at conversational volume';
+    } else {
+      tip = 'Voice recognition performing optimally';
+    }
+  }
+
+  const actionsCount = telemetrySession.logs.length;
+  const statusString = `System Status: ${actionsCount} Actions Logged in ${durationFormatted} • Response Speed: ${responseSpeed} • Usability: ${usability}% (Tip: ${tip})`;
+
+  return {
+    statusString,
+    actionsCount,
+    durationFormatted,
+    responseSpeed,
+    usability,
+    tip
+  };
+}
+
+function sendTelemetrySummary() {
+  if (!cursorTrackingPort) return;
+  try {
+    const data = getTelemetryStatusData();
+    cursorTrackingPort.postMessage({
+      type: 'TELEMETRY_STATUS_UPDATE',
+      ...data
+    });
+  } catch (e) {}
+}
+
+// Helpers for human-friendly formatting in CSV
 function escapeCsv(value) {
   const text = typeof value === 'string' ? value : String(value ?? '');
   return `"${text.replace(/"/g, '""')}"`;
@@ -133,23 +189,11 @@ function parseLogForCommoner(log, index) {
 
 function exportEvaluationCSV() {
   const m = telemetrySession.metrics;
-  const totalDurationSec = Math.max(1, Math.round((performance.now() - telemetrySession.startTime) / 1000));
-  const durationFormatted = totalDurationSec >= 60
-    ? `${Math.floor(totalDurationSec / 60)}m ${totalDurationSec % 60}s`
-    : `${totalDurationSec}s`;
-
-  const asrLogs = telemetrySession.logs.filter(l => l.category === 'VOICE_ASR' && Number.isFinite(l.latencyMs));
-  const avgLatencyMs = asrLogs.length > 0
-    ? Math.round(asrLogs.reduce((acc, l) => acc + l.latencyMs, 0) / asrLogs.length)
-    : null;
+  const statusData = getTelemetryStatusData();
 
   const recognizedCmds = m.recognizedCommands || 0;
   const unrecognized = m.unrecognizedUtterances || 0;
   const totalVoiceAttempts = recognizedCmds + unrecognized;
-  const voiceAccuracyPct = totalVoiceAttempts > 0
-    ? Math.round((recognizedCmds / totalVoiceAttempts) * 100)
-    : (asrLogs.length > 0 ? 100 : null);
-
   const voiceClicks = m.voiceClicks || 0;
   const dwellClicks = m.dwellClicks || 0;
   const totalClicks = m.totalClicks || (voiceClicks + dwellClicks);
@@ -159,99 +203,54 @@ function exportEvaluationCSV() {
   let stars = '★★★★★';
   let gradeSummary = 'System performed excellently with high accuracy and fast responsiveness.';
 
-  if (voiceAccuracyPct !== null) {
-    if (voiceAccuracyPct >= 90) {
-      letterGrade = `Grade A (${voiceAccuracyPct}%)`;
+  if (totalVoiceAttempts > 0) {
+    if (statusData.usability >= 90) {
+      letterGrade = `Grade A (${statusData.usability}%)`;
       stars = '★★★★★';
       gradeSummary = 'System performed excellently with high voice accuracy and fast response.';
-    } else if (voiceAccuracyPct >= 75) {
-      letterGrade = `Grade B (${voiceAccuracyPct}%)`;
+    } else if (statusData.usability >= 75) {
+      letterGrade = `Grade B (${statusData.usability}%)`;
       stars = '★★★★☆';
-      gradeSummary = 'Good performance. Most commands were recognized quickly with minor repeats.';
-    } else if (voiceAccuracyPct >= 60) {
-      letterGrade = `Grade C (${voiceAccuracyPct}%)`;
+      gradeSummary = 'Good performance. Most commands were recognized quickly.';
+    } else if (statusData.usability >= 60) {
+      letterGrade = `Grade C (${statusData.usability}%)`;
       stars = '★★★☆☆';
-      gradeSummary = 'Satisfactory. Consider speaking slightly clearer or checking microphone level.';
+      gradeSummary = 'Satisfactory. Consider speaking slightly clearer or moving closer to mic.';
     } else {
-      letterGrade = `Grade D (${voiceAccuracyPct}%)`;
+      letterGrade = `Grade D (${statusData.usability}%)`;
       stars = '★★☆☆☆';
-      gradeSummary = 'Needs adjustment. Check microphone distance and background noise.';
+      gradeSummary = 'Needs adjustment. Move closer to microphone to reduce ambient noise.';
     }
-  } else if (telemetrySession.logs.length > 0) {
-    letterGrade = 'Grade A (Ready)';
-    stars = '★★★★★';
-    gradeSummary = 'All handsfree components responded smoothly during this session.';
-  } else {
-    letterGrade = 'Grade A (New Session)';
-    stars = '★★★★★';
-    gradeSummary = 'Session initialized and ready for hands-free navigation.';
   }
 
-  const voiceBar = makeVisualBar(voiceAccuracyPct);
-  const voiceExplanation = voiceAccuracyPct !== null
-    ? `Out of ${totalVoiceAttempts} voice commands evaluated, ${recognizedCmds} were recognized correctly.`
-    : 'No voice commands were spoken yet during this session.';
-
-  const speedRating = avgLatencyMs !== null
-    ? `${avgLatencyMs} ms (${(avgLatencyMs / 1000).toFixed(2)}s)`
-    : 'N/A';
-  const speedBar = avgLatencyMs !== null
-    ? (avgLatencyMs < 400 ? '⚡ Ultra-Fast (<400ms)' : avgLatencyMs < 800 ? '⚡ Fast (<800ms)' : '⏱️ Normal')
-    : '[No audio samples]';
-  const speedExplanation = avgLatencyMs !== null
-    ? `The speech AI processed commands in ~${avgLatencyMs}ms locally on your computer (faster than an eye blink).`
-    : 'Inference latency will be calculated as soon as you speak a command.';
-
-  const clickSummary = `${totalClicks} Clicks (${voiceClicks} Voice Click + ${dwellClicks} Gaze Dwell)`;
-  const clickBar = totalClicks > 0
-    ? `[${voiceClicks} by Voice / ${dwellClicks} by Gaze]`
-    : '[No clicks recorded]';
-  const clickExplanation = totalClicks > 0
-    ? `You activated ${totalClicks} button/link clicks completely hands-free (${voiceClicks} saying "click", ${dwellClicks} resting head).`
-    : 'Try saying "click" or resting your head steady for 1 second over any button to click hands-free.';
-
-  const navSummary = `${m.tabSwitches || 0} Tab Switches, ${telemetrySession.logs.length} Actions`;
-  const navBar = '✓ Fully Operational';
-  const navExplanation = 'The handsfree system is tracking head gaze and listening for voice commands.';
-
   const lines = [
-    toCsvRow(['====================================================================================================']),
-    toCsvRow(['📊 HANDSFREE ACCESSIBILITY SYSTEM - PERFORMANCE EVALUATION REPORT']),
-    toCsvRow(['Designed for common users to easily check how well hands-free navigation is working.']),
-    toCsvRow(['====================================================================================================']),
+    '# HANDSFREE ACCESSIBILITY SYSTEM - PERFORMANCE EVALUATION METRICS',
+    `# Export Date: ${new Date().toISOString()} | Session ID: ${telemetrySession.sessionId}`,
     '',
-    toCsvRow(['--- SECTION 1: OVERALL USABILITY GRADE & SUMMARY ---']),
-    toCsvRow(['Metric / Summary Item', 'Score / Value', 'Visual Rating', 'Plain-English Meaning for Common Users']),
+    'SECTION 1: SYSTEM USABILITY SUMMARY',
+    toCsvRow(['Metric', 'Value', 'Rating', 'Plain English Explanation']),
+    toCsvRow(['System Status', statusData.actionsCount + ' Actions', 'Active', statusData.statusString]),
     toCsvRow(['Overall Usability Grade', letterGrade, stars, gradeSummary]),
-    toCsvRow(['Session Usage Duration', durationFormatted, '[Active Session]', 'Total time you navigated the web hands-free in this session.']),
-    toCsvRow(['Report Generation Time', new Date().toLocaleString(), '', 'Timestamp when this performance evaluation report was exported.']),
-    toCsvRow(['Total Actions Logged', `${telemetrySession.logs.length} actions`, '', 'Total number of voice commands, clicks, and page interactions recorded.']),
+    toCsvRow(['Session Usage Duration', statusData.durationFormatted, 'Active', 'Total time spent navigating the web hands-free during this session']),
+    toCsvRow(['Average Response Speed', statusData.responseSpeed, 'Speed Rating', `Average speech recognition inference latency (${statusData.responseSpeed})`]),
+    toCsvRow(['Voice Usability Rate', `${statusData.usability}%`, `${recognizedCmds}/${totalVoiceAttempts || 1} Commands`, `${recognizedCmds} commands recognized out of ${totalVoiceAttempts} voice attempts`]),
+    toCsvRow(['Handsfree Clicks', `${totalClicks} Clicks`, 'Interactive', `${voiceClicks} voice clicks by saying "click" and ${dwellClicks} gaze clicks by holding still for 1s`]),
+    toCsvRow(['Tab Switches', `${m.tabSwitches || 0} Switches`, 'Navigation', 'Browser tabs navigated hands-free using voice commands']),
+    toCsvRow(['Privacy & Security', '100% On-Device', 'Private', 'All speech recognition and camera tracking ran completely on your device without cloud upload']),
     '',
-    toCsvRow(['--- SECTION 2: THE 4 EVERYDAY QUESTIONS (EASY SCORECARD) ---']),
-    toCsvRow(['Everyday Question', 'Score / Result', 'Visual Progress Bar', 'What This Means in Plain English']),
-    toCsvRow(['1. Did the computer understand your voice?', voiceAccuracyPct !== null ? `${voiceAccuracyPct}%` : 'N/A', voiceBar, voiceExplanation]),
-    toCsvRow(['2. How fast did the system react?', speedRating, speedBar, speedExplanation]),
-    toCsvRow(['3. How did you click buttons and links?', clickSummary, clickBar, clickExplanation]),
-    toCsvRow(['4. Did handsfree navigation work?', navSummary, navBar, navExplanation]),
-    '',
-    toCsvRow(['--- SECTION 3: HELPFUL TIPS FOR BEST EXPERIENCE ---']),
-    toCsvRow(['Category', 'Status', 'Helpful Advice in Plain Language', 'Why This Matters']),
-    toCsvRow(['🎤 Microphone & Voice', 'Recommended', 'Speak naturally at normal conversational volume about 1 to 2 feet away.', 'Helps the local speech AI distinguish your words clearly from background sounds.']),
-    toCsvRow(['💡 Lighting & Camera', 'Recommended', 'Make sure your face is evenly illuminated with no strong backlight.', 'Allows the webcam to track your nose position with smooth pixel precision.']),
-    toCsvRow(['🔒 Privacy & Safety', '100% On-Device', 'All voice recognition and camera tracking stay private on your laptop.', 'No audio or video ever leaves your computer or gets uploaded to the cloud.']),
-    '',
-    toCsvRow(['--- SECTION 4: STEP-BY-STEP ACTIVITY STORY (LINE-BY-LINE EXPLANATION) ---']),
-    toCsvRow(['Step #', 'Time (MM:SS)', 'What You Did', 'What the Computer Did', 'Speed / Status', 'Plain-English Explanation for Common People'])
+    'SECTION 2: STEP-BY-STEP ACTIVITY LOG',
+    toCsvRow(['Step', 'Time (MM:SS)', 'Action Category', 'What You Did', 'What The Computer Did', 'Speed / Status', 'Plain English Explanation'])
   ];
 
   if (telemetrySession.logs.length === 0) {
-    lines.push(toCsvRow(['-', '00:00', 'Started session', 'Ready for handsfree input', '✓ Ready', 'No actions have been performed yet. Try speaking "scroll down" or "click"!']));
+    lines.push(toCsvRow([1, '00:00', 'SESSION_START', 'Started handsfree session', 'Initialized speech and gaze tracking', '✓ Ready', 'Handsfree system initialized and waiting for voice commands or gaze.']));
   } else {
     telemetrySession.logs.forEach((log, idx) => {
       const parsed = parseLogForCommoner(log, idx);
       lines.push(toCsvRow([
         parsed.step,
         parsed.time,
+        log.category || 'ACTION',
         parsed.whatYouDid,
         parsed.whatComputerDid,
         parsed.speedStatus,
@@ -260,8 +259,7 @@ function exportEvaluationCSV() {
     });
   }
 
-  // Prepend UTF-8 Byte Order Mark (\uFEFF) so Microsoft Excel opens it seamlessly with all symbols & formatting
-  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const csvContent = lines.join('\r\n');
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
 
@@ -467,6 +465,7 @@ initEngine();
 browser.runtime.onConnect.addListener((port) => {
   if (port.name === 'cursor-tracking') {
     cursorTrackingPort = port;
+    sendTelemetrySummary();
 
     port.onDisconnect.addListener(() => {
       if (cursorTrackingPort === port) cursorTrackingPort = null;
@@ -484,6 +483,8 @@ browser.runtime.onConnect.addListener((port) => {
           stickyHold: msg.stickyHold,
           dwellDuration: msg.dwellDuration
         });
+      } else if (msg && msg.type === 'GET_TELEMETRY_STATUS') {
+        sendTelemetrySummary();
       }
     });
   }
@@ -551,6 +552,7 @@ browser.runtime.onConnect.addListener((port) => {
                   const config = COMMANDS[cmd];
                   console.log(`[Handsfree Command Triggered]: "${cmd}"`);
                   telemetrySession.metrics.recognizedCommands++;
+                  sendTelemetrySummary();
 
                   if (config.action === 'NEXT_TAB') {
                     cycleTab(1);
@@ -586,6 +588,7 @@ browser.runtime.onConnect.addListener((port) => {
 
               if (!matched) {
                 telemetrySession.metrics.unrecognizedUtterances++;
+                sendTelemetrySummary();
                 console.log(`[Handsfree] No command matched in: "${lower}"`);
               }
             } else if (currentMode === 'DICTATION') {

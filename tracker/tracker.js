@@ -158,6 +158,11 @@ function connectCursorPort() {
         startCalibration();
       } else if (msg?.type === 'NEXT_CALIB_POINT') {
         if (calibrationMode) handleCalibrationAdvance();
+      } else if (msg?.type === 'TELEMETRY_STATUS_UPDATE') {
+        const statusTextEl = document.getElementById('system-status-text');
+        if (statusTextEl && msg.statusString) {
+          statusTextEl.innerText = msg.statusString;
+        }
       }
     });
 
@@ -166,10 +171,22 @@ function connectCursorPort() {
       if (ipcStatusEl) ipcStatusEl.innerText = 'Reconnecting...';
       setTimeout(connectCursorPort, 1000);
     });
+
+    // Request initial telemetry status upon connection
+    cursorPort.postMessage({ type: 'GET_TELEMETRY_STATUS' });
   } catch (e) {
     setTimeout(connectCursorPort, 1000);
   }
 }
+
+// Periodically sync system status with background telemetry
+setInterval(() => {
+  if (cursorPort) {
+    try {
+      cursorPort.postMessage({ type: 'GET_TELEMETRY_STATUS' });
+    } catch (e) {}
+  }
+}, 1000);
 
 function connectAudioPort() {
   try {

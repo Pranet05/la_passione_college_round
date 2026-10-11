@@ -233,6 +233,41 @@
       color: #f1f5f9;
       font-family: monospace;
     }
+    .system-status-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      font-size: 12px;
+      color: #e2e8f0;
+      line-height: 1.45;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+    .system-status-pill {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+    }
+    .status-pulse-dot {
+      width: 8px;
+      height: 8px;
+      min-width: 8px;
+      border-radius: 50%;
+      background: #38bdf8;
+      box-shadow: 0 0 8px #38bdf8;
+      animation: pulse 2s infinite ease-in-out;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.5; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.1); }
+    }
+    #system-status-text {
+      font-weight: 500;
+      color: #f1f5f9;
+    }
   </style>
 </head>
 <body>
@@ -241,6 +276,13 @@
       <h2>Handsfree Control Hub</h2>
       <span class="badge" id="ipc-status">Connecting...</span>
     </header>
+
+    <div class="system-status-card" id="system-status-card">
+      <div class="system-status-pill">
+        <span class="status-pulse-dot"></span>
+        <span id="system-status-text">System Status: 0 Actions Logged in 0s • Response Speed: Ready • Usability: 100% (Tip: Speak commands like "down" or "click")</span>
+      </div>
+    </div>
 
     <div class="viewport">
       <video id="webcam" autoplay playsinline muted></video>
