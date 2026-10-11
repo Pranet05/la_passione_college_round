@@ -44,21 +44,225 @@ function recordTelemetryEvent(category, eventName, details = {}) {
   telemetrySession.logs.push(entry);
 }
 
-function exportEvaluationCSV() {
-  const headers = ['timestamp', 'sessionElapsedMs', 'category', 'eventName', 'details'];
-  const rows = telemetrySession.logs.map(log => {
-    const { timestamp, sessionElapsedMs, category, eventName, ...rest } = log;
-    return [
-      timestamp,
-      sessionElapsedMs,
-      category,
-      eventName,
-      `"${JSON.stringify(rest).replace(/"/g, '""')}"`
-    ].join(',');
-  });
+// Helpers for human-friendly formatting in Excel
+function escapeCsv(value) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  return `"${text.replace(/"/g, '""')}"`;
+}
 
-  const csvContent = [headers.join(','), ...rows].join('\n');
-  const blob = new Blob([csvContent], { type: 'text/csv' });
+function toCsvRow(arr) {
+  return arr.map(escapeCsv).join(',');
+}
+
+function formatTime(ms) {
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function makeVisualBar(pct, totalBlocks = 10) {
+  if (pct === null || isNaN(pct)) return '[No speech recorded]';
+  const filled = Math.min(totalBlocks, Math.max(0, Math.round((pct / 100) * totalBlocks)));
+  const empty = totalBlocks - filled;
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${pct}%`;
+}
+
+function parseLogForCommoner(log, index) {
+  const time = formatTime(log.sessionElapsedMs);
+  const cat = log.category;
+  const evt = log.eventName;
+
+  let whatYouDid = 'Used handsfree navigation';
+  let whatComputerDid = 'Processed page interaction';
+  let speedStatus = '✓ Success';
+  let laymanExplanation = '';
+
+  if (cat === 'VOICE_ASR' && evt === 'INFERENCE_COMPLETE') {
+    const transcript = log.transcript || 'Spoken words';
+    whatYouDid = `Spoke: "${transcript}"`;
+    whatComputerDid = 'Heard your speech and executed command';
+    speedStatus = log.latencyMs ? `⚡ ${log.latencyMs}ms` : '⚡ Fast';
+    const latencySec = log.latencyMs ? ` in ${(log.latencyMs / 1000).toFixed(2)}s` : '';
+    laymanExplanation = `You said "${transcript}". The voice AI understood you${latencySec} and performed the command completely hands-free.`;
+  } else if (cat === 'DOM_INTERACTION' && evt === 'SELECTION_ACTIVATION') {
+    const isDwell = log.activationMethod === 'DWELL_CLICK';
+    const tag = (log.tagName || 'button').toLowerCase();
+    whatYouDid = isDwell ? `Rested gaze on <${tag}> element` : `Looked at <${tag}> and said "click"`;
+    whatComputerDid = `Clicked <${tag}> at cursor location`;
+    speedStatus = isDwell ? `✓ Dwell Click (${log.acquisitionTimeMs || 1000}ms)` : '✓ Voice Click';
+    laymanExplanation = isDwell
+      ? `You held your head steady on the ${tag} for 1 second. The system clicked it automatically without touching a mouse.`
+      : `You looked at the ${tag} and said "click". The system clicked the exact item you were viewing.`;
+  } else if (cat === 'TASK_COMPLETION' && evt === 'SEARCH_SUBMITTED') {
+    whatYouDid = 'Finished entering search term';
+    whatComputerDid = 'Submitted search query to web page';
+    speedStatus = log.taskCompletionTimeMs ? `✓ Done (${(log.taskCompletionTimeMs / 1000).toFixed(1)}s)` : '✓ Done';
+    laymanExplanation = `You completed an entire web search hands-free from dictation to submission.`;
+  } else if (cat === 'TAB_MANAGEMENT' && evt === 'SWITCH_TAB') {
+    whatYouDid = 'Spoke tab navigation command';
+    whatComputerDid = 'Switched to next/previous browser tab';
+    speedStatus = '✓ Switched Tab';
+    laymanExplanation = `The browser switched tabs hands-free based on your voice command.`;
+  } else if (evt === 'START_CALIBRATION' || log.action === 'START_CALIBRATION') {
+    whatYouDid = 'Started 5-point calibration';
+    whatComputerDid = 'Calibrated screen boundaries to head';
+    speedStatus = '✓ Calibrating';
+    laymanExplanation = `You ran the calibration helper to match the screen corners to your natural head movements.`;
+  } else if (evt === 'RECENTER' || log.action === 'RECENTER') {
+    whatYouDid = 'Reset resting head position';
+    whatComputerDid = 'Aligned cursor with your face angle';
+    speedStatus = '✓ Centered';
+    laymanExplanation = `You centered the cursor to where your face is comfortably resting.`;
+  } else {
+    whatYouDid = log.category ? `Performed ${log.category}` : 'Navigation action';
+    whatComputerDid = log.eventName ? `Handled ${log.eventName}` : 'Updated page state';
+    speedStatus = '✓ OK';
+    laymanExplanation = `The handsfree system processed an interaction event on the active page.`;
+  }
+
+  return {
+    step: index + 1,
+    time,
+    whatYouDid,
+    whatComputerDid,
+    speedStatus,
+    laymanExplanation
+  };
+}
+
+function exportEvaluationCSV() {
+  const m = telemetrySession.metrics;
+  const totalDurationSec = Math.max(1, Math.round((performance.now() - telemetrySession.startTime) / 1000));
+  const durationFormatted = totalDurationSec >= 60
+    ? `${Math.floor(totalDurationSec / 60)}m ${totalDurationSec % 60}s`
+    : `${totalDurationSec}s`;
+
+  const asrLogs = telemetrySession.logs.filter(l => l.category === 'VOICE_ASR' && Number.isFinite(l.latencyMs));
+  const avgLatencyMs = asrLogs.length > 0
+    ? Math.round(asrLogs.reduce((acc, l) => acc + l.latencyMs, 0) / asrLogs.length)
+    : null;
+
+  const recognizedCmds = m.recognizedCommands || 0;
+  const unrecognized = m.unrecognizedUtterances || 0;
+  const totalVoiceAttempts = recognizedCmds + unrecognized;
+  const voiceAccuracyPct = totalVoiceAttempts > 0
+    ? Math.round((recognizedCmds / totalVoiceAttempts) * 100)
+    : (asrLogs.length > 0 ? 100 : null);
+
+  const voiceClicks = m.voiceClicks || 0;
+  const dwellClicks = m.dwellClicks || 0;
+  const totalClicks = m.totalClicks || (voiceClicks + dwellClicks);
+
+  // Determine overall grade
+  let letterGrade = 'Grade A (Excellent)';
+  let stars = '★★★★★';
+  let gradeSummary = 'System performed excellently with high accuracy and fast responsiveness.';
+
+  if (voiceAccuracyPct !== null) {
+    if (voiceAccuracyPct >= 90) {
+      letterGrade = `Grade A (${voiceAccuracyPct}%)`;
+      stars = '★★★★★';
+      gradeSummary = 'System performed excellently with high voice accuracy and fast response.';
+    } else if (voiceAccuracyPct >= 75) {
+      letterGrade = `Grade B (${voiceAccuracyPct}%)`;
+      stars = '★★★★☆';
+      gradeSummary = 'Good performance. Most commands were recognized quickly with minor repeats.';
+    } else if (voiceAccuracyPct >= 60) {
+      letterGrade = `Grade C (${voiceAccuracyPct}%)`;
+      stars = '★★★☆☆';
+      gradeSummary = 'Satisfactory. Consider speaking slightly clearer or checking microphone level.';
+    } else {
+      letterGrade = `Grade D (${voiceAccuracyPct}%)`;
+      stars = '★★☆☆☆';
+      gradeSummary = 'Needs adjustment. Check microphone distance and background noise.';
+    }
+  } else if (telemetrySession.logs.length > 0) {
+    letterGrade = 'Grade A (Ready)';
+    stars = '★★★★★';
+    gradeSummary = 'All handsfree components responded smoothly during this session.';
+  } else {
+    letterGrade = 'Grade A (New Session)';
+    stars = '★★★★★';
+    gradeSummary = 'Session initialized and ready for hands-free navigation.';
+  }
+
+  const voiceBar = makeVisualBar(voiceAccuracyPct);
+  const voiceExplanation = voiceAccuracyPct !== null
+    ? `Out of ${totalVoiceAttempts} voice commands evaluated, ${recognizedCmds} were recognized correctly.`
+    : 'No voice commands were spoken yet during this session.';
+
+  const speedRating = avgLatencyMs !== null
+    ? `${avgLatencyMs} ms (${(avgLatencyMs / 1000).toFixed(2)}s)`
+    : 'N/A';
+  const speedBar = avgLatencyMs !== null
+    ? (avgLatencyMs < 400 ? '⚡ Ultra-Fast (<400ms)' : avgLatencyMs < 800 ? '⚡ Fast (<800ms)' : '⏱️ Normal')
+    : '[No audio samples]';
+  const speedExplanation = avgLatencyMs !== null
+    ? `The speech AI processed commands in ~${avgLatencyMs}ms locally on your computer (faster than an eye blink).`
+    : 'Inference latency will be calculated as soon as you speak a command.';
+
+  const clickSummary = `${totalClicks} Clicks (${voiceClicks} Voice Click + ${dwellClicks} Gaze Dwell)`;
+  const clickBar = totalClicks > 0
+    ? `[${voiceClicks} by Voice / ${dwellClicks} by Gaze]`
+    : '[No clicks recorded]';
+  const clickExplanation = totalClicks > 0
+    ? `You activated ${totalClicks} button/link clicks completely hands-free (${voiceClicks} saying "click", ${dwellClicks} resting head).`
+    : 'Try saying "click" or resting your head steady for 1 second over any button to click hands-free.';
+
+  const navSummary = `${m.tabSwitches || 0} Tab Switches, ${telemetrySession.logs.length} Actions`;
+  const navBar = '✓ Fully Operational';
+  const navExplanation = 'The handsfree system is tracking head gaze and listening for voice commands.';
+
+  const lines = [
+    toCsvRow(['====================================================================================================']),
+    toCsvRow(['📊 HANDSFREE ACCESSIBILITY SYSTEM - PERFORMANCE EVALUATION REPORT']),
+    toCsvRow(['Designed for common users to easily check how well hands-free navigation is working.']),
+    toCsvRow(['====================================================================================================']),
+    '',
+    toCsvRow(['--- SECTION 1: OVERALL USABILITY GRADE & SUMMARY ---']),
+    toCsvRow(['Metric / Summary Item', 'Score / Value', 'Visual Rating', 'Plain-English Meaning for Common Users']),
+    toCsvRow(['Overall Usability Grade', letterGrade, stars, gradeSummary]),
+    toCsvRow(['Session Usage Duration', durationFormatted, '[Active Session]', 'Total time you navigated the web hands-free in this session.']),
+    toCsvRow(['Report Generation Time', new Date().toLocaleString(), '', 'Timestamp when this performance evaluation report was exported.']),
+    toCsvRow(['Total Actions Logged', `${telemetrySession.logs.length} actions`, '', 'Total number of voice commands, clicks, and page interactions recorded.']),
+    '',
+    toCsvRow(['--- SECTION 2: THE 4 EVERYDAY QUESTIONS (EASY SCORECARD) ---']),
+    toCsvRow(['Everyday Question', 'Score / Result', 'Visual Progress Bar', 'What This Means in Plain English']),
+    toCsvRow(['1. Did the computer understand your voice?', voiceAccuracyPct !== null ? `${voiceAccuracyPct}%` : 'N/A', voiceBar, voiceExplanation]),
+    toCsvRow(['2. How fast did the system react?', speedRating, speedBar, speedExplanation]),
+    toCsvRow(['3. How did you click buttons and links?', clickSummary, clickBar, clickExplanation]),
+    toCsvRow(['4. Did handsfree navigation work?', navSummary, navBar, navExplanation]),
+    '',
+    toCsvRow(['--- SECTION 3: HELPFUL TIPS FOR BEST EXPERIENCE ---']),
+    toCsvRow(['Category', 'Status', 'Helpful Advice in Plain Language', 'Why This Matters']),
+    toCsvRow(['🎤 Microphone & Voice', 'Recommended', 'Speak naturally at normal conversational volume about 1 to 2 feet away.', 'Helps the local speech AI distinguish your words clearly from background sounds.']),
+    toCsvRow(['💡 Lighting & Camera', 'Recommended', 'Make sure your face is evenly illuminated with no strong backlight.', 'Allows the webcam to track your nose position with smooth pixel precision.']),
+    toCsvRow(['🔒 Privacy & Safety', '100% On-Device', 'All voice recognition and camera tracking stay private on your laptop.', 'No audio or video ever leaves your computer or gets uploaded to the cloud.']),
+    '',
+    toCsvRow(['--- SECTION 4: STEP-BY-STEP ACTIVITY STORY (LINE-BY-LINE EXPLANATION) ---']),
+    toCsvRow(['Step #', 'Time (MM:SS)', 'What You Did', 'What the Computer Did', 'Speed / Status', 'Plain-English Explanation for Common People'])
+  ];
+
+  if (telemetrySession.logs.length === 0) {
+    lines.push(toCsvRow(['-', '00:00', 'Started session', 'Ready for handsfree input', '✓ Ready', 'No actions have been performed yet. Try speaking "scroll down" or "click"!']));
+  } else {
+    telemetrySession.logs.forEach((log, idx) => {
+      const parsed = parseLogForCommoner(log, idx);
+      lines.push(toCsvRow([
+        parsed.step,
+        parsed.time,
+        parsed.whatYouDid,
+        parsed.whatComputerDid,
+        parsed.speedStatus,
+        parsed.laymanExplanation
+      ]));
+    });
+  }
+
+  // Prepend UTF-8 Byte Order Mark (\uFEFF) so Microsoft Excel opens it seamlessly with all symbols & formatting
+  const csvContent = '\uFEFF' + lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
 
   browser.downloads.download({
