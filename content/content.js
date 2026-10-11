@@ -24,7 +24,6 @@ if (!cursorEl) {
     transition: 'opacity 0.15s ease'
   });
 
-  // SVG circular progress ring for Sticky Hold Dwell
   cursorEl.innerHTML = `
     <svg style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: rotate(-90deg); overflow: visible;" viewBox="0 0 36 36">
       <circle cx="18" cy="18" r="14" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="2" />
@@ -84,27 +83,46 @@ document.addEventListener('mousemove', (e) => {
   lastHoveredElement = e.target;
 }, { passive: true });
 
-// --- 2. Focus Monitoring for Automatic Mode Switching ---
+// --- 2. Focus Monitoring for Automatic Mode Switching & Highlight Styling ---
 function isTextInput(el) {
   if (!el) return false;
   const tag = el.tagName?.toLowerCase();
   return (
     tag === 'textarea' ||
-    (tag === 'input' && !['checkbox', 'radio', 'button', 'submit', 'range', 'color'].includes(el.type)) ||
+    (tag === 'input' && !['checkbox', 'radio', 'button', 'submit', 'range', 'color', 'file', 'image'].includes(el.type)) ||
     el.isContentEditable ||
     el.getAttribute?.('role') === 'textbox' ||
+    el.getAttribute?.('role') === 'searchbox' ||
     Boolean(el.closest?.('[contenteditable="true"]'))
   );
 }
 
+// Visual highlight badge for Handsfree active text field
+function applyFieldHighlight(el) {
+  if (!el) return;
+  el.style.outline = '3px solid #38bdf8';
+  el.style.outlineOffset = '2px';
+  el.style.boxShadow = '0 0 14px rgba(56, 189, 248, 0.65)';
+  el.style.transition = 'outline 0.15s ease, box-shadow 0.15s ease';
+}
+
+function removeFieldHighlight(el) {
+  if (!el) return;
+  el.style.outline = '';
+  el.style.outlineOffset = '';
+  el.style.boxShadow = '';
+}
+
 document.addEventListener('focusin', (e) => {
   if (isTextInput(e.target)) {
+    applyFieldHighlight(e.target);
     browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'DICTATION' });
   }
 });
 
 document.addEventListener('focusout', (e) => {
   if (isTextInput(e.target)) {
+    removeFieldHighlight(e.target);
     browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'NAVIGATION' });
   }
 });
@@ -135,13 +153,11 @@ function getClickableAt(x, y) {
 function updateCursorRender() {
   rafScheduled = false;
 
-  // Sticky magnetic friction over clickable targets
   const clickable = getClickableAt(targetScreenX, targetScreenY);
   if (clickable) {
     const rect = clickable.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
-    // Gentle magnetic attraction towards center of button/link
     currentScreenX = currentScreenX + (targetScreenX - currentScreenX) * 0.75 + (centerX - currentScreenX) * 0.08;
     currentScreenY = currentScreenY + (targetScreenY - currentScreenY) * 0.75 + (centerY - currentScreenY) * 0.08;
   } else {
@@ -153,7 +169,6 @@ function updateCursorRender() {
     cursorEl.style.transform = `translate3d(${currentScreenX - 18}px, ${currentScreenY - 18}px, 0)`;
   }
 
-  // Update drag event coordinates if in voice HOLD state
   if (isHoldingDrag && holdDragTarget) {
     const mouseInit = {
       bubbles: true,
@@ -165,11 +180,10 @@ function updateCursorRender() {
     holdDragTarget.dispatchEvent(new MouseEvent('mousemove', mouseInit));
   }
 
-  // Handle Sticky Dwell Hold Progress
   checkStickyDwellHold(clickable);
 }
 
-// --- 4. Sticky Dwell Hold Engine (Hold Still to Auto-Click) ---
+// --- 4. Sticky Dwell Hold Engine ---
 function checkStickyDwellHold(clickable) {
   const now = performance.now();
 
@@ -185,19 +199,16 @@ function checkStickyDwellHold(clickable) {
       const elapsed = now - dwellStartTime;
       const progress = Math.min(1.0, elapsed / dwellDurationMs);
 
-      // 87.96 is circle circumference (2 * PI * 14)
       if (holdRingProgress) {
         const offset = 87.96 * (1.0 - progress);
         holdRingProgress.style.strokeDashoffset = `${offset}`;
       }
 
       if (progress >= 1.0) {
-        // Trigger Hold Click!
         triggerClick(currentScreenX, currentScreenY, clickable);
         dwellCooldownUntil = now + 900;
         resetDwellRing();
 
-        // Visual click ripple
         if (pointerDot) {
           pointerDot.style.transform = 'scale(1.8)';
           pointerDot.style.backgroundColor = '#22c55e';
@@ -210,7 +221,6 @@ function checkStickyDwellHold(clickable) {
         }
       }
     } else {
-      // Start dwell on new element or reset anchor
       dwellTargetElement = clickable;
       dwellStartTime = now;
       dwellAnchorX = currentScreenX;
@@ -252,13 +262,14 @@ browser.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === 'MODE_CHANGE') {
     if (msg.mode === 'NAVIGATION') {
       if (document.activeElement && typeof document.activeElement.blur === 'function') {
+        removeFieldHighlight(document.activeElement);
         document.activeElement.blur();
       }
     }
   }
 });
 
-// --- 6. Command Execution & Click / Hold / Release ---
+// --- 6. Command Execution & Search Highlighting ---
 function handleNavigationCommand(command, payload) {
   switch (command) {
     case 'SCROLL': {
@@ -275,7 +286,7 @@ function handleNavigationCommand(command, payload) {
       const el = document.activeElement;
       if (!el) return;
 
-      console.log('[Handsfree] Submitting search / pressing Enter on:', el);
+      removeFieldHighlight(el);
 
       const enterOptions = {
         key: 'Enter',
@@ -309,7 +320,6 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'HOLD': {
-      // Sticky Voice Hold (Mouse Down / Drag initiate)
       const holdX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const holdY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
 
@@ -346,12 +356,10 @@ function handleNavigationCommand(command, payload) {
       target.dispatchEvent(createEvent('pointerdown'));
       target.dispatchEvent(createEvent('mousedown'));
       if (typeof target.focus === 'function') target.focus();
-      console.log('[Handsfree] Sticky HOLD active on:', target);
       break;
     }
 
     case 'RELEASE': {
-      // Sticky Voice Release (Mouse Up / Drop)
       const relX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const relY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
 
@@ -388,26 +396,87 @@ function handleNavigationCommand(command, payload) {
         pointerDot.style.boxShadow = '0 0 10px rgba(239, 68, 68, 0.8)';
         pointerDot.style.transform = 'scale(1.0)';
       }
-      console.log('[Handsfree] Sticky RELEASE triggered on:', releaseTarget);
       break;
     }
 
     case 'FOCUS_SEARCH': {
-      const searchBox = document.querySelector(
-        '#searchInput, input[type="search"], textarea[name="q"], input[name="q"], input[name="search_query"], input[name="search"], textarea[name="search"], input[placeholder*="search" i], textarea[placeholder*="search" i], [role="searchbox"], input[aria-label*="search" i], button[aria-label*="search" i], .cdx-text-input__input'
-      );
-      if (searchBox) {
-        if (typeof searchBox.scrollIntoView === 'function') {
-          searchBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        }
-        if (searchBox.tagName === 'BUTTON' || searchBox.getAttribute('role') === 'button') {
-          searchBox.click();
-        } else {
-          searchBox.focus();
-          if (typeof searchBox.select === 'function') {
-            searchBox.select();
+      // Prioritized selectors covering Wikipedia (Vector & legacy), YouTube, Google, and standard HTML5 inputs
+      const selectors = [
+        '#searchInput',
+        '.cdx-text-input__input',
+        'input[type="search"]',
+        'textarea[name="q"]',
+        'input[name="q"]',
+        'input[name="search_query"]',
+        'input[name="search"]',
+        'input[title*="search" i]',
+        'input[placeholder*="search" i]',
+        'textarea[placeholder*="search" i]',
+        '[role="searchbox"]',
+        'input[aria-label*="search" i]'
+      ];
+
+      let targetInput = null;
+
+      // 1. Locate the first matching, visible text field
+      for (const sel of selectors) {
+        const matches = document.querySelectorAll(sel);
+        for (const el of matches) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            targetInput = el;
+            break;
           }
         }
+        if (targetInput) break;
+      }
+
+      // 2. If the actual input is hidden behind an expandable button (e.g. mobile/responsive bars)
+      if (!targetInput) {
+        const triggerBtn = document.querySelector('button[aria-label*="search" i], [role="button"][aria-label*="search" i]');
+        if (triggerBtn) {
+          triggerBtn.click();
+          setTimeout(() => {
+            handleNavigationCommand('FOCUS_SEARCH', payload);
+          }, 150);
+          return;
+        }
+      }
+
+      if (targetInput) {
+        // Bring into view smoothly if tucked at top
+        if (typeof targetInput.scrollIntoView === 'function') {
+          targetInput.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
+        // Snap the red virtual cursor to the input center
+        const rect = targetInput.getBoundingClientRect();
+        targetScreenX = rect.left + rect.width / 2;
+        targetScreenY = rect.top + rect.height / 2;
+        currentScreenX = targetScreenX;
+        currentScreenY = targetScreenY;
+        if (cursorEl) {
+          cursorEl.style.transform = `translate3d(${currentScreenX - 18}px, ${currentScreenY - 18}px, 0)`;
+        }
+
+        // Full activation sequence: Click -> Focus -> Select All
+        const mouseEvt = { bubbles: true, cancelable: true, view: window };
+        targetInput.dispatchEvent(new MouseEvent('mousedown', mouseEvt));
+        targetInput.dispatchEvent(new MouseEvent('mouseup', mouseEvt));
+        targetInput.dispatchEvent(new MouseEvent('click', mouseEvt));
+
+        targetInput.focus({ preventScroll: true });
+        if (typeof targetInput.select === 'function') {
+          targetInput.select();
+        }
+
+        // Apply high-visibility blue glow highlight
+        applyFieldHighlight(targetInput);
+
+        // Tell background.js to enter DICTATION mode immediately
+        browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'DICTATION' });
+      } else {
+        console.warn('[Handsfree] No search input found on this page.');
       }
       break;
     }
@@ -502,7 +571,6 @@ function triggerClick(clickX, clickY, knownTarget = null) {
     target.dispatchEvent(createEvent('click'));
   }
 
-  // Anchor fallback
   if (clickable.tagName === 'A' && clickable.href && !clickable.href.startsWith('javascript:')) {
     setTimeout(() => {
       if (window.location.href !== clickable.href && !clickable.href.startsWith('#')) {

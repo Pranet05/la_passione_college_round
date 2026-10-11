@@ -39,10 +39,15 @@ btn.addEventListener('click', async () => {
       port.postMessage({ audioChunk: Array.from(inputData) });
     };
 
-    // Chain: Source -> HighPass -> Processor -> Destination
+    // 3. Mute Gain Node: Prevents microphone feedback/echo through your headphones
+    const muteNode = audioContext.createGain();
+    muteNode.gain.setValueAtTime(0, audioContext.currentTime);
+
+    // Chain: Source -> HighPass -> Processor -> MuteNode (Gain=0) -> Destination
     source.connect(highPass);
     highPass.connect(processor);
-    processor.connect(audioContext.destination);
+    processor.connect(muteNode);
+    muteNode.connect(audioContext.destination);
 
     statusEl.innerText = '✅ Filtered audio streaming active! Keep this tab open.';
     btn.disabled = true;

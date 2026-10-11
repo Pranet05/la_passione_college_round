@@ -16,7 +16,7 @@ let cursorTrackingPort = null;
 // Synchronous active tab cache to eliminate IPC roundtrip lag during cursor streaming
 let activeTabId = null;
 
-// High-speed VAD parameters: ~250ms pause triggers inference
+// High-speed VAD parameters: ~250-300ms pause triggers inference
 const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
@@ -29,6 +29,15 @@ const COMMANDS = {
   'up': { action: 'SCROLL', payload: { y: -350 } },
   'page down': { action: 'SCROLL', payload: { y: 600 } },
   'page up': { action: 'SCROLL', payload: { y: -600 } },
+
+  // Tab switching commands
+  'next tab': { action: 'NEXT_TAB' },
+  'switch tab': { action: 'NEXT_TAB' },
+  'previous tab': { action: 'PREV_TAB' },
+  'prev tab': { action: 'PREV_TAB' },
+  'last tab': { action: 'PREV_TAB' },
+  'new tab': { action: 'NEW_TAB' },
+  'close tab': { action: 'CLOSE_TAB' },
 
   // Click & phonetic Whisper variations
   'click': { action: 'CLICK' },
@@ -60,7 +69,68 @@ const COMMANDS = {
   'clear': { action: 'CLEAR' }
 };
 
-// 1. Maintain Active Web Tab Target Synchronously
+// --- Tab Navigation Handlers ---
+
+// Switches to the next or previous regular web tab
+async function cycleTab(direction = 1) {
+  try {
+    const currentWindow = await browser.windows.getCurrent({ populate: true });
+    if (!currentWindow || !currentWindow.tabs) return;
+
+    // Filter to navigable web tabs, skipping internal extension pages
+    const webTabs = currentWindow.tabs.filter(t => 
+      t.url && (t.url.startsWith('http://') || t.url.startsWith('https://') || t.url.startsWith('about:blank') || t.url.startsWith('about:home'))
+    );
+
+    if (webTabs.length <= 1) return;
+
+    const currentTab = currentWindow.tabs.find(t => t.active);
+    const currentIndex = webTabs.findIndex(t => t.id === currentTab?.id);
+
+    let nextIndex;
+    if (currentIndex === -1) {
+      nextIndex = 0;
+    } else {
+      nextIndex = (currentIndex + direction + webTabs.length) % webTabs.length;
+    }
+
+    const targetTab = webTabs[nextIndex];
+    if (targetTab?.id) {
+      await browser.tabs.update(targetTab.id, { active: true });
+      activeTabId = targetTab.id;
+      console.log(`[Handsfree] Switched to tab: ${targetTab.title || targetTab.id}`);
+    }
+  } catch (err) {
+    console.error('[Handsfree] Failed to cycle tab:', err);
+  }
+}
+
+// Opens a new blank tab and activates it
+async function createNewTab() {
+  try {
+    const tab = await browser.tabs.create({ active: true });
+    activeTabId = tab.id;
+    console.log('[Handsfree] Opened new tab.');
+  } catch (err) {
+    console.error('[Handsfree] Failed to create tab:', err);
+  }
+}
+
+// Closes current active tab (guards against closing the tracker or mic tab)
+async function closeCurrentTab() {
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs[0];
+    if (tab && !tab.url.startsWith('moz-extension://')) {
+      await browser.tabs.remove(tab.id);
+      console.log('[Handsfree] Closed active tab.');
+    }
+  } catch (err) {
+    console.error('[Handsfree] Failed to close tab:', err);
+  }
+}
+
+// Maintain Active Web Tab Target
 async function updateActiveTab() {
   try {
     const focusedTabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
@@ -87,7 +157,7 @@ if (browser.windows?.onFocusChanged) {
 }
 updateActiveTab();
 
-// Synchronous, non-blocking message dispatcher (Zero IPC query lag!)
+// Synchronous, non-blocking message dispatcher
 function sendToTab(msg) {
   if (activeTabId) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
@@ -99,7 +169,7 @@ function sendToTab(msg) {
   }
 }
 
-// 2. Initialize Whisper Speech Recognizer
+// Initialize Whisper Speech Recognizer
 async function initEngine() {
   console.log('[Handsfree] Initializing local speech model...');
   try {
@@ -114,7 +184,7 @@ async function initEngine() {
 
 initEngine();
 
-// 3. Port Connections (Audio & Tracker Streams)
+// Port Connections
 browser.runtime.onConnect.addListener((port) => {
   // --- High-Speed Nose Tracking Stream ---
   if (port.name === 'cursor-tracking') {
@@ -139,7 +209,7 @@ browser.runtime.onConnect.addListener((port) => {
     });
   }
 
-  // --- Audio Stream from unified tracker tab ---
+  // --- Audio Stream ---
   if (port.name === 'audio-stream') {
     console.log('[Handsfree] Audio stream port connected.');
 
@@ -164,8 +234,8 @@ browser.runtime.onConnect.addListener((port) => {
           audioBufferChunk = [];
           silenceFrames = 0;
 
-          // Drop noise bursts shorter than 0.20 seconds
-          if (fullBuffer.length < 16000 * 0.20) return;
+          // Drop noise bursts shorter than 0.35 seconds to avoid corrupting speech recognition
+          if (fullBuffer.length < 16000 * 0.35) return;
 
           console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
 
@@ -189,11 +259,21 @@ browser.runtime.onConnect.addListener((port) => {
                 if (lower.includes(cmd)) {
                   console.log(`[Handsfree Command Triggered]: ${cmd}`);
 
-                  if (config.action === 'RECENTER') {
+                  // Handle Browser-Level Operations
+                  if (config.action === 'NEXT_TAB') {
+                    cycleTab(1);
+                  } else if (config.action === 'PREV_TAB') {
+                    cycleTab(-1);
+                  } else if (config.action === 'NEW_TAB') {
+                    createNewTab();
+                  } else if (config.action === 'CLOSE_TAB') {
+                    closeCurrentTab();
+                  } else if (config.action === 'RECENTER') {
                     if (cursorTrackingPort) {
                       cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
                     }
                   } else {
+                    // Handle Page-Level DOM Operations
                     const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
                     const payload = isCoordCommand
                       ? { x: latestCursor.x, y: latestCursor.y }
@@ -201,6 +281,7 @@ browser.runtime.onConnect.addListener((port) => {
 
                     sendToTab({ type: 'COMMAND', command: config.action, payload });
                   }
+
                   matched = true;
                   break;
                 }
@@ -212,14 +293,15 @@ browser.runtime.onConnect.addListener((port) => {
             } else if (currentMode === 'DICTATION') {
               const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
 
-              if (cleanText.includes('stop dictating') || cleanText.includes('escape')) {
+              if (cleanText === 'stop dictating' || cleanText === 'escape' || cleanText.endsWith(' stop dictating')) {
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (
                 cleanText === 'search' ||
                 cleanText === 'enter' ||
                 cleanText === 'submit' ||
-                cleanText.endsWith(' search')
+                cleanText === 'press enter' ||
+                cleanText === 'press search'
               ) {
                 console.log(`[Handsfree] Intercepted SEARCH / SUBMIT command from: "${transcript}"`);
                 sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
@@ -275,7 +357,7 @@ function mergeAudioBuffers(buffers) {
   return result;
 }
 
-// Listen for mode changes triggered by DOM focus in content.js
+// Mode changes triggered by DOM focus in content.js
 browser.runtime.onMessage.addListener((message) => {
   if (message.type === 'SET_MODE') {
     currentMode = message.mode;
