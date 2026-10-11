@@ -55,7 +55,7 @@
       width: 100%;
       height: 100%;
       object-fit: cover;
-      transform: scaleX(-1); /* Mirror camera feed */
+      transform: scaleX(-1);
     }
     .crosshair {
       position: absolute;
@@ -131,10 +131,10 @@
       transition: background 0.15s ease;
     }
     .btn:hover { background: #1d4ed8; }
-    .btn-secondary {
-      background: #334155;
-    }
+    .btn-secondary { background: #334155; }
     .btn-secondary:hover { background: #475569; }
+    .btn-calib { background: #0284c7; }
+    .btn-calib:hover { background: #0369a1; }
     .mic-meter-container {
       display: flex;
       align-items: center;
@@ -210,12 +210,8 @@
       transition: .2s;
       border-radius: 50%;
     }
-    input:checked + .slider-round {
-      background-color: #0284c7;
-    }
-    input:checked + .slider-round:before {
-      transform: translateX(20px);
-    }
+    input:checked + .slider-round { background-color: #0284c7; }
+    input:checked + .slider-round:before { transform: translateX(20px); }
     .commands-card {
       background: #0f172a;
       border: 1px solid #1e293b;
@@ -277,6 +273,7 @@
 
       <div style="display: flex; gap: 10px;">
         <button class="btn" id="recenter-btn" style="flex: 1;">🎯 Recenter Gaze (Space / Say "Center")</button>
+        <button class="btn btn-calib" id="calib-btn" style="flex: 1;">📐 30s 5-Point Calibration</button>
       </div>
 
       <div class="slider-group">
@@ -303,7 +300,6 @@
         <input type="range" id="smooth-factor" min="0.20" max="0.80" step="0.05" value="0.45">
       </div>
 
-      <!-- Sticky Hold Settings -->
       <div class="toggle-row">
         <div>
           <div style="font-weight: 600; font-size: 13px;">🎯 Sticky Hold (Dwell Click)</div>
@@ -327,13 +323,13 @@
         <strong>Voice Commands:</strong>
         <div class="cmd-grid">
           <div><span class="cmd-tag">"click"</span> or <span class="cmd-tag">"tap"</span></div>
-          <div><span class="cmd-tag">"hold"</span> (grab / drag)</div>
+          <div><span class="cmd-tag">"next tab"</span> / <span class="cmd-tag">"prev tab"</span></div>
+          <div><span class="cmd-tag">"hold"</span> (grab/drag)</div>
           <div><span class="cmd-tag">"release"</span> (drop)</div>
           <div><span class="cmd-tag">"search"</span> (focus search)</div>
-          <div><span class="cmd-tag">"scroll down"</span> / <span class="cmd-tag">"down"</span></div>
-          <div><span class="cmd-tag">"scroll up"</span> / <span class="cmd-tag">"up"</span></div>
-          <div><span class="cmd-tag">"center"</span> (recalibrate gaze)</div>
-          <div><span class="cmd-tag">"clear"</span> (empty field)</div>
+          <div><span class="cmd-tag">"scroll down"</span> / <span class="cmd-tag">"up"</span></div>
+          <div><span class="cmd-tag">"calibrate"</span> (5-pt wizard)</div>
+          <div><span class="cmd-tag">"export metrics"</span> (CSV)</div>
         </div>
       </div>
     </div>

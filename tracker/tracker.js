@@ -11,6 +11,7 @@ const metricsEl = document.getElementById('metrics');
 const ipcStatusEl = document.getElementById('ipc-status');
 const micLevelEl = document.getElementById('mic-level');
 const recenterBtn = document.getElementById('recenter-btn');
+const calibBtn = document.getElementById('calib-btn');
 const popoutBtn = document.getElementById('popout-btn');
 
 const sensXSlider = document.getElementById('sens-x');
@@ -24,7 +25,6 @@ const sensYVal = document.getElementById('sens-y-val');
 const smoothVal = document.getElementById('smooth-val');
 const dwellVal = document.getElementById('dwell-val');
 
-// Configurable multipliers & smoothing
 let sensitivityX = parseFloat(sensXSlider?.value || 4.2);
 let sensitivityY = parseFloat(sensYSlider?.value || 4.8);
 let smoothFactor = parseFloat(smoothSlider?.value || 0.45);
@@ -61,25 +61,106 @@ let lastVideoTime = -1;
 let cursorPort = null;
 let audioPort = null;
 
-// Gaze calibration: Resting neutral head posture maps to exact center (0.5, 0.5)
 let calibratedOriginX = null;
 let calibratedOriginY = null;
 let smoothX = 0.5;
 let smoothY = 0.5;
+let lastRawNoseX = 0.5;
+let lastRawNoseY = 0.5;
 
 let lastSend = 0;
-const SEND_INTERVAL = 16; // ~60 FPS buttery smooth delivery
+const SEND_INTERVAL = 16; // ~60 FPS
+
+// --- 30-Second 5-Point Calibration Wizard Engine ---
+let calibrationMode = false;
+let calibrationStep = 0;
+const calibrationPoints = [
+  { name: 'Center', prompt: 'Look directly at the screen center' },
+  { name: 'Top-Left', prompt: 'Look at the top-left corner' },
+  { name: 'Top-Right', prompt: 'Look at the top-right corner' },
+  { name: 'Bottom-Left', prompt: 'Look at the bottom-left corner' },
+  { name: 'Bottom-Right', prompt: 'Look at the bottom-right corner' }
+];
+
+let calibBounds = {
+  minX: 0.38,
+  maxX: 0.62,
+  minY: 0.38,
+  maxY: 0.62,
+  calibrated: false
+};
+
+function startCalibration() {
+  calibrationMode = true;
+  calibrationStep = 0;
+  updateCalibrationUI();
+}
+
+function handleCalibrationAdvance() {
+  if (!calibrationMode) {
+    calibrateCenter();
+    return;
+  }
+
+  switch (calibrationStep) {
+    case 0:
+      calibratedOriginX = lastRawNoseX;
+      calibratedOriginY = lastRawNoseY;
+      break;
+    case 1:
+      calibBounds.minX = lastRawNoseX;
+      calibBounds.minY = lastRawNoseY;
+      break;
+    case 2:
+      calibBounds.maxX = lastRawNoseX;
+      calibBounds.minY = Math.min(calibBounds.minY, lastRawNoseY);
+      break;
+    case 3:
+      calibBounds.minX = Math.min(calibBounds.minX, lastRawNoseX);
+      calibBounds.maxY = lastRawNoseY;
+      break;
+    case 4:
+      calibBounds.maxX = Math.max(calibBounds.maxX, lastRawNoseX);
+      calibBounds.maxY = Math.max(calibBounds.maxY, lastRawNoseY);
+      calibBounds.calibrated = true;
+      calibrationMode = false;
+      if (statusEl) statusEl.innerText = '✅ 5-Point Calibration Complete!';
+      if (calibBtn) calibBtn.innerText = '📐 Calibrated!';
+      setTimeout(() => { if (calibBtn) calibBtn.innerText = '📐 30s 5-Point Calibration'; }, 2000);
+      return;
+  }
+
+  calibrationStep++;
+  updateCalibrationUI();
+}
+
+function updateCalibrationUI() {
+  if (statusEl) {
+    statusEl.innerText = `🎯 [${calibrationStep + 1}/5]${calibrationPoints[calibrationStep].prompt} (Say "click" / Space)`;
+  }
+}
+
+calibBtn?.addEventListener('click', () => {
+  if (!calibrationMode) startCalibration();
+  else handleCalibrationAdvance();
+});
 
 // 1. Establish Ports with Background Service
 function connectCursorPort() {
   try {
     cursorPort = extApi.runtime.connect({ name: 'cursor-tracking' });
     if (ipcStatusEl) ipcStatusEl.innerText = 'Connected';
+
     cursorPort.onMessage.addListener((msg) => {
       if (msg?.type === 'CALIBRATE') {
         calibrateCenter();
+      } else if (msg?.type === 'START_CALIBRATION') {
+        startCalibration();
+      } else if (msg?.type === 'NEXT_CALIB_POINT') {
+        if (calibrationMode) handleCalibrationAdvance();
       }
     });
+
     cursorPort.onDisconnect.addListener(() => {
       cursorPort = null;
       if (ipcStatusEl) ipcStatusEl.innerText = 'Reconnecting...';
@@ -105,10 +186,6 @@ function connectAudioPort() {
 connectCursorPort();
 connectAudioPort();
 
-// 2. Center Calibration
-let lastRawNoseX = 0.5;
-let lastRawNoseY = 0.5;
-
 function calibrateCenter() {
   calibratedOriginX = lastRawNoseX;
   calibratedOriginY = lastRawNoseY;
@@ -125,11 +202,11 @@ function calibrateCenter() {
 recenterBtn?.addEventListener('click', calibrateCenter);
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' || e.code === 'KeyC') {
-    calibrateCenter();
+    if (calibrationMode) handleCalibrationAdvance();
+    else calibrateCenter();
   }
 });
 
-// Popout Window Support
 popoutBtn?.addEventListener('click', async () => {
   try {
     if (extApi.windows?.create) {
@@ -145,24 +222,21 @@ popoutBtn?.addEventListener('click', async () => {
   }
 });
 
-// 3. Audio Capture Engine (Unified)
+// 2. Audio Capture Engine (Unified)
 async function initAudio(stream) {
   try {
     const audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(stream);
 
-    // High-pass filter: Cuts low breath pops & desk rumbles (< 120 Hz)
     const highPass = audioContext.createBiquadFilter();
     highPass.type = 'highpass';
     highPass.frequency.setValueAtTime(120, audioContext.currentTime);
 
-    // ScriptProcessor for 2048-sample audio chunking (~128ms per chunk)
     const processor = audioContext.createScriptProcessor(2048, 1, 1);
 
     processor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
 
-      // Calculate instantaneous volume for UI meter
       let sum = 0;
       for (let i = 0; i < inputData.length; i++) {
         sum += inputData[i] * inputData[i];
@@ -178,9 +252,14 @@ async function initAudio(stream) {
       }
     };
 
+    // Muted GainNode route to eliminate headphone audio playback/echo
+    const muteNode = audioContext.createGain();
+    muteNode.gain.setValueAtTime(0, audioContext.currentTime);
+
     source.connect(highPass);
     highPass.connect(processor);
-    processor.connect(audioContext.destination);
+    processor.connect(muteNode);
+    muteNode.connect(audioContext.destination);
 
     if (micStatusEl) micStatusEl.innerText = 'Microphone streaming active';
     if (micDot) { micDot.className = 'dot green'; }
@@ -191,7 +270,7 @@ async function initAudio(stream) {
   }
 }
 
-// 4. Video & Face Mesh Tracker Engine
+// 3. Video & Face Mesh Tracker Engine
 async function initTracker() {
   try {
     if (statusEl) statusEl.innerText = 'Initializing WASM Runtime...';
@@ -244,7 +323,7 @@ async function initTracker() {
   }
 }
 
-// 5. High-Speed Processing Loop with Adaptive Smoothing
+// 4. High-Speed Processing Loop with Adaptive Smoothing
 function startProcessingLoop() {
   let frameCounter = 0;
 
@@ -257,16 +336,13 @@ function startProcessingLoop() {
         const results = faceLandmarker.detectForVideo(video, now);
 
         if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-          // Landmark 1: Nose tip
           const nose = results.faceLandmarks[0][1];
 
-          // Mirror horizontally for natural webcam interaction
           const rawX = 1.0 - nose.x;
           const rawY = nose.y;
           lastRawNoseX = rawX;
           lastRawNoseY = rawY;
 
-          // Auto-calibrate center on first detection so cursor starts EXACTLY at (0.5, 0.5)
           if (calibratedOriginX === null || calibratedOriginY === null) {
             frameCounter++;
             if (frameCounter >= 3) {
@@ -274,15 +350,20 @@ function startProcessingLoop() {
             }
           }
 
-          const originX = calibratedOriginX ?? 0.5;
-          const originY = calibratedOriginY ?? 0.5;
+          let targetX, targetY;
 
-          // Project around calibrated neutral head posture
-          const targetX = 0.5 + (rawX - originX) * sensitivityX;
-          const targetY = 0.5 + (rawY - originY) * sensitivityY;
+          if (calibBounds.calibrated) {
+            const spanX = (calibBounds.maxX - calibBounds.minX) || 0.25;
+            const spanY = (calibBounds.maxY - calibBounds.minY) || 0.25;
+            targetX = (rawX - calibBounds.minX) / spanX;
+            targetY = (rawY - calibBounds.minY) / spanY;
+          } else {
+            const originX = calibratedOriginX ?? 0.5;
+            const originY = calibratedOriginY ?? 0.5;
+            targetX = 0.5 + (rawX - originX) * sensitivityX;
+            targetY = 0.5 + (rawY - originY) * sensitivityY;
+          }
 
-          // Adaptive dynamic smoothing: fast movements track instantly (0 lag),
-          // slow micro-movements stay smooth without jitter
           const deltaDist = Math.hypot(targetX - smoothX, targetY - smoothY);
           const dynamicFactor = Math.min(0.85, smoothFactor + deltaDist * 2.5);
 
@@ -303,7 +384,7 @@ function startProcessingLoop() {
             });
 
             if (metricsEl) {
-              metricsEl.innerText = `Nose: (${clampedX.toFixed(2)}, ${clampedY.toFixed(2)})`;
+              metricsEl.innerText = `Nose: (${clampedX.toFixed(2)}, ${clampedY.toFixed(2)}) \vert{} Calibrated:${calibBounds.calibrated}`;
             }
           }
         }
@@ -311,12 +392,9 @@ function startProcessingLoop() {
     }
   };
 
-  // Launch Web Worker timer (immune to Firefox background tab throttling)
   try {
     const worker = new Worker('worker.js');
-    worker.onmessage = () => {
-      processFrame();
-    };
+    worker.onmessage = () => { processFrame(); };
     worker.postMessage('start');
   } catch (e) {
     setInterval(processFrame, 16);

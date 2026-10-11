@@ -1,4 +1,4 @@
-// content.js - Virtual Pointer Overlay, DOM Actions & Dictation Engine
+// content.js - Virtual Pointer Overlay, DOM Actions, Dictation & Evaluation Engine
 
 // --- 1. Mount Hardware-Accelerated Virtual Cursor with Sticky Hold Ring ---
 let cursorEl = document.getElementById('handsfree-virtual-pointer');
@@ -78,6 +78,10 @@ let dwellCooldownUntil = 0;
 let isHoldingDrag = false;
 let holdDragTarget = null;
 
+// Telemetry & Task Evaluation Timers
+let taskStartTime = performance.now();
+let lastTargetHoverTime = performance.now();
+
 // Track mouse position if physical mouse is used
 document.addEventListener('mousemove', (e) => {
   lastHoveredElement = e.target;
@@ -97,7 +101,7 @@ function isTextInput(el) {
   );
 }
 
-// Visual highlight badge for Handsfree active text field
+// Visual highlight badge for active text field
 function applyFieldHighlight(el) {
   if (!el) return;
   el.style.outline = '3px solid #38bdf8';
@@ -149,7 +153,7 @@ function getClickableAt(x, y) {
   return el.closest('a, button, [role="button"], input, select, textarea, [tabindex], label');
 }
 
-// --- 3. Ultra-Smooth RequestAnimationFrame Cursor Loop with Sticky Snapping ---
+// --- 3. Cursor Loop with Sticky Snapping ---
 function updateCursorRender() {
   rafScheduled = false;
 
@@ -205,7 +209,7 @@ function checkStickyDwellHold(clickable) {
       }
 
       if (progress >= 1.0) {
-        triggerClick(currentScreenX, currentScreenY, clickable);
+        triggerClick(currentScreenX, currentScreenY, clickable, 'DWELL_CLICK');
         dwellCooldownUntil = now + 900;
         resetDwellRing();
 
@@ -225,6 +229,7 @@ function checkStickyDwellHold(clickable) {
       dwellStartTime = now;
       dwellAnchorX = currentScreenX;
       dwellAnchorY = currentScreenY;
+      lastTargetHoverTime = now;
       if (holdRingProgress) {
         holdRingProgress.style.strokeDashoffset = '87.96';
       }
@@ -287,6 +292,14 @@ function handleNavigationCommand(command, payload) {
       if (!el) return;
 
       removeFieldHighlight(el);
+      const taskElapsed = Math.round(performance.now() - taskStartTime);
+
+      browser.runtime.sendMessage({
+        type: 'TELEMETRY_LOG',
+        category: 'TASK_COMPLETION',
+        eventName: 'SEARCH_SUBMITTED',
+        details: { taskCompletionTimeMs: taskElapsed }
+      });
 
       const enterOptions = {
         key: 'Enter',
@@ -315,7 +328,7 @@ function handleNavigationCommand(command, payload) {
     case 'CLICK': {
       const clickX = (payload?.x !== undefined) ? (payload.x * window.innerWidth) : currentScreenX;
       const clickY = (payload?.y !== undefined) ? (payload.y * window.innerHeight) : currentScreenY;
-      triggerClick(clickX, clickY);
+      triggerClick(clickX, clickY, null, 'VOICE_CLICK');
       break;
     }
 
@@ -400,7 +413,7 @@ function handleNavigationCommand(command, payload) {
     }
 
     case 'FOCUS_SEARCH': {
-      // Prioritized selectors covering Wikipedia (Vector & legacy), YouTube, Google, and standard HTML5 inputs
+      taskStartTime = performance.now();
       const selectors = [
         '#searchInput',
         '.cdx-text-input__input',
@@ -418,7 +431,6 @@ function handleNavigationCommand(command, payload) {
 
       let targetInput = null;
 
-      // 1. Locate the first matching, visible text field
       for (const sel of selectors) {
         const matches = document.querySelectorAll(sel);
         for (const el of matches) {
@@ -431,7 +443,6 @@ function handleNavigationCommand(command, payload) {
         if (targetInput) break;
       }
 
-      // 2. If the actual input is hidden behind an expandable button (e.g. mobile/responsive bars)
       if (!targetInput) {
         const triggerBtn = document.querySelector('button[aria-label*="search" i], [role="button"][aria-label*="search" i]');
         if (triggerBtn) {
@@ -444,12 +455,10 @@ function handleNavigationCommand(command, payload) {
       }
 
       if (targetInput) {
-        // Bring into view smoothly if tucked at top
         if (typeof targetInput.scrollIntoView === 'function') {
           targetInput.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
 
-        // Snap the red virtual cursor to the input center
         const rect = targetInput.getBoundingClientRect();
         targetScreenX = rect.left + rect.width / 2;
         targetScreenY = rect.top + rect.height / 2;
@@ -459,7 +468,6 @@ function handleNavigationCommand(command, payload) {
           cursorEl.style.transform = `translate3d(${currentScreenX - 18}px, ${currentScreenY - 18}px, 0)`;
         }
 
-        // Full activation sequence: Click -> Focus -> Select All
         const mouseEvt = { bubbles: true, cancelable: true, view: window };
         targetInput.dispatchEvent(new MouseEvent('mousedown', mouseEvt));
         targetInput.dispatchEvent(new MouseEvent('mouseup', mouseEvt));
@@ -470,10 +478,7 @@ function handleNavigationCommand(command, payload) {
           targetInput.select();
         }
 
-        // Apply high-visibility blue glow highlight
         applyFieldHighlight(targetInput);
-
-        // Tell background.js to enter DICTATION mode immediately
         browser.runtime.sendMessage({ type: 'SET_MODE', mode: 'DICTATION' });
       } else {
         console.warn('[Handsfree] No search input found on this page.');
@@ -518,7 +523,7 @@ function handleNavigationCommand(command, payload) {
 }
 
 // Reusable click performer
-function triggerClick(clickX, clickY, knownTarget = null) {
+function triggerClick(clickX, clickY, knownTarget = null, activationMethod = 'VOICE_CLICK') {
   if (cursorEl) cursorEl.style.display = 'none';
   let target = knownTarget || document.elementFromPoint(clickX, clickY);
   if (cursorEl) cursorEl.style.display = 'flex';
@@ -532,6 +537,21 @@ function triggerClick(clickX, clickY, knownTarget = null) {
   if (!target) return;
 
   const clickable = target.closest('a, button, [role="button"], input, select, textarea, [tabindex], label') || target;
+  const isInteractive = Boolean(clickable && clickable !== document.body && clickable !== document.documentElement);
+  const acquisitionTimeMs = Math.round(performance.now() - lastTargetHoverTime);
+
+  // Send evaluation metric
+  browser.runtime.sendMessage({
+    type: 'TELEMETRY_LOG',
+    category: 'DOM_INTERACTION',
+    eventName: 'SELECTION_ACTIVATION',
+    details: {
+      activationMethod,
+      tagName: clickable.tagName,
+      isInteractiveTarget: isInteractive,
+      acquisitionTimeMs
+    }
+  });
 
   if (pointerDot) {
     pointerDot.style.transform = 'scale(1.6)';

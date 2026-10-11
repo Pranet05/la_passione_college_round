@@ -1,6 +1,5 @@
 import { pipeline, env } from './transformers.min.js';
 
-// Use browser internal CacheStorage and Hugging Face remote endpoints on initial load
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
@@ -9,17 +8,65 @@ let currentMode = 'NAVIGATION';
 let audioBufferChunk = [];
 let silenceFrames = 0;
 
-// Holds latest normalized nose coordinates streamed from tracker.js
 let latestCursor = { x: 0.5, y: 0.5 };
 let cursorTrackingPort = null;
-
-// Synchronous active tab cache to eliminate IPC roundtrip lag during cursor streaming
 let activeTabId = null;
 
 // High-speed VAD parameters: ~250-300ms pause triggers inference
 const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
+
+// --- Performance Evaluation Telemetry Engine ---
+const telemetrySession = {
+  sessionId: `session_${Date.now()}`,
+  startTime: performance.now(),
+  logs: [],
+  metrics: {
+    totalVoiceCommands: 0,
+    recognizedCommands: 0,
+    unrecognizedUtterances: 0,
+    totalClicks: 0,
+    dwellClicks: 0,
+    voiceClicks: 0,
+    tabSwitches: 0
+  }
+};
+
+function recordTelemetryEvent(category, eventName, details = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    sessionElapsedMs: Math.round(performance.now() - telemetrySession.startTime),
+    category,
+    eventName,
+    ...details
+  };
+  telemetrySession.logs.push(entry);
+}
+
+function exportEvaluationCSV() {
+  const headers = ['timestamp', 'sessionElapsedMs', 'category', 'eventName', 'details'];
+  const rows = telemetrySession.logs.map(log => {
+    const { timestamp, sessionElapsedMs, category, eventName, ...rest } = log;
+    return [
+      timestamp,
+      sessionElapsedMs,
+      category,
+      eventName,
+      `"${JSON.stringify(rest).replace(/"/g, '""')}"`
+    ].join(',');
+  });
+
+  const csvContent = [headers.join(','), ...rows].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+
+  browser.downloads.download({
+    url,
+    filename: `handsfree_evaluation_${Date.now()}.csv`,
+    saveAs: true
+  });
+}
 
 const COMMANDS = {
   // Navigation scrolling
@@ -39,7 +86,7 @@ const COMMANDS = {
   'new tab': { action: 'NEW_TAB' },
   'close tab': { action: 'CLOSE_TAB' },
 
-  // Click & phonetic Whisper variations
+  // Click & phonetic variations
   'click': { action: 'CLICK' },
   'quick': { action: 'CLICK' },
   'clique': { action: 'CLICK' },
@@ -61,20 +108,20 @@ const COMMANDS = {
   'search': { action: 'FOCUS_SEARCH' },
   'find': { action: 'FOCUS_SEARCH' },
 
-  // Gaze center recalibration
+  // Calibration & Telemetry triggers
+  'start calibration': { action: 'START_CALIBRATION' },
+  'calibrate': { action: 'START_CALIBRATION' },
   'recenter': { action: 'RECENTER' },
   'center': { action: 'RECENTER' },
+  'export metrics': { action: 'EXPORT_METRICS' },
+  'download stats': { action: 'EXPORT_METRICS' },
 
-  // Input reset
+  // Reset
   'clear': { action: 'CLEAR' }
 };
 
-// --- Tab Navigation Handlers ---
-
 // --- Reliable Multi-Window Tab Navigation Handlers ---
-
 async function getNormalBrowserTabs() {
-  // 1. Target the last-focused normal browser window
   let targetWindow = null;
   try {
     targetWindow = await browser.windows.getLastFocused({ populate: true, windowTypes: ['normal'] });
@@ -84,7 +131,6 @@ async function getNormalBrowserTabs() {
 
   if (!targetWindow || !targetWindow.tabs) return { currentWindow: null, webTabs: [] };
 
-  // 2. Filter out extension utility tabs (tracker, mic permission, devtools)
   const webTabs = targetWindow.tabs.filter(t => 
     t.url && !t.url.startsWith('moz-extension://') && !t.url.startsWith('about:debugging')
   );
@@ -95,13 +141,8 @@ async function getNormalBrowserTabs() {
 async function cycleTab(direction = 1) {
   try {
     const { currentWindow, webTabs } = await getNormalBrowserTabs();
+    if (webTabs.length <= 1) return;
 
-    if (webTabs.length <= 1) {
-      console.warn('[Handsfree] Not enough web tabs to cycle through.');
-      return;
-    }
-
-    // Identify which tab is currently active in that window
     const activeTab = currentWindow.tabs.find(t => t.active);
     const currentIndex = webTabs.findIndex(t => t.id === activeTab?.id);
 
@@ -114,13 +155,11 @@ async function cycleTab(direction = 1) {
 
     const targetTab = webTabs[nextIndex];
     if (targetTab?.id) {
-      // 1. Activate tab
       await browser.tabs.update(targetTab.id, { active: true });
-      // 2. Ensure its parent window is brought to the foreground
       await browser.windows.update(targetTab.windowId, { focused: true });
-
       activeTabId = targetTab.id;
-      console.log(`[Handsfree] Switched to tab: ${targetTab.title || targetTab.id}`);
+      telemetrySession.metrics.tabSwitches++;
+      recordTelemetryEvent('TAB_MANAGEMENT', 'SWITCH_TAB', { toTabId: targetTab.id });
     }
   } catch (err) {
     console.error('[Handsfree] Failed to cycle tab:', err);
@@ -130,11 +169,9 @@ async function cycleTab(direction = 1) {
 async function createNewTab() {
   try {
     const { currentWindow } = await getNormalBrowserTabs();
-    const windowId = currentWindow ? currentWindow.id : undefined;
-
     const newTab = await browser.tabs.create({ 
       active: true, 
-      windowId: windowId 
+      windowId: currentWindow ? currentWindow.id : undefined 
     });
 
     if (newTab.windowId) {
@@ -142,7 +179,7 @@ async function createNewTab() {
     }
 
     activeTabId = newTab.id;
-    console.log('[Handsfree] Opened new tab.');
+    recordTelemetryEvent('TAB_MANAGEMENT', 'NEW_TAB', { tabId: newTab.id });
   } catch (err) {
     console.error('[Handsfree] Failed to create tab:', err);
   }
@@ -156,14 +193,13 @@ async function closeCurrentTab() {
     const activeTab = currentWindow.tabs.find(t => t.active);
     if (activeTab && !activeTab.url.startsWith('moz-extension://')) {
       await browser.tabs.remove(activeTab.id);
-      console.log('[Handsfree] Closed active tab.');
+      recordTelemetryEvent('TAB_MANAGEMENT', 'CLOSE_TAB', { tabId: activeTab.id });
     }
   } catch (err) {
     console.error('[Handsfree] Failed to close tab:', err);
   }
 }
 
-// Maintain Active Web Tab Target
 async function updateActiveTab() {
   try {
     const focusedTabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
@@ -178,9 +214,7 @@ async function updateActiveTab() {
     if (fallback?.id) {
       activeTabId = fallback.id;
     }
-  } catch (e) {
-    // Fail silently during transitions
-  }
+  } catch (e) {}
 }
 
 browser.tabs.onActivated.addListener(() => { updateActiveTab(); });
@@ -190,7 +224,6 @@ if (browser.windows?.onFocusChanged) {
 }
 updateActiveTab();
 
-// Synchronous, non-blocking message dispatcher
 function sendToTab(msg) {
   if (activeTabId) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
@@ -202,26 +235,21 @@ function sendToTab(msg) {
   }
 }
 
-// Initialize Whisper Speech Recognizer
 async function initEngine() {
-  console.log('[Handsfree] Initializing local speech model...');
+  console.log('[Handsfree] Initializing Whisper model...');
   try {
     transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny.en', {
       quantized: true
     });
-    console.log('[Handsfree] Local speech recognizer ready.');
+    console.log('[Handsfree] Speech recognizer ready.');
   } catch (err) {
     console.error('[Handsfree] Speech engine init error:', err);
   }
 }
-
 initEngine();
 
-// Port Connections
 browser.runtime.onConnect.addListener((port) => {
-  // --- High-Speed Nose Tracking Stream ---
   if (port.name === 'cursor-tracking') {
-    console.log('[Handsfree] Cursor tracking port connected.');
     cursorTrackingPort = port;
 
     port.onDisconnect.addListener(() => {
@@ -236,16 +264,15 @@ browser.runtime.onConnect.addListener((port) => {
         sendToTab({
           type: 'UPDATE_CURSOR',
           x: msg.x,
-          y: msg.y
+          y: msg.y,
+          stickyHold: msg.stickyHold,
+          dwellDuration: msg.dwellDuration
         });
       }
     });
   }
 
-  // --- Audio Stream ---
   if (port.name === 'audio-stream') {
-    console.log('[Handsfree] Audio stream port connected.');
-
     port.onMessage.addListener(async (msg) => {
       if (!msg.audioChunk || !transcriber) return;
 
@@ -267,22 +294,27 @@ browser.runtime.onConnect.addListener((port) => {
           audioBufferChunk = [];
           silenceFrames = 0;
 
-          // Drop noise bursts shorter than 0.35 seconds to avoid corrupting speech recognition
           if (fullBuffer.length < 16000 * 0.35) return;
 
-          console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
-
           try {
+            telemetrySession.metrics.totalVoiceCommands++;
+            const t0 = performance.now();
             const output = await transcriber(fullBuffer);
+            const inferenceMs = Math.round(performance.now() - t0);
+
             let transcript = '';
             if (typeof output === 'string') transcript = output;
             else if (Array.isArray(output) && output[0]?.text) transcript = output[0].text;
             else if (output?.text) transcript = output.text;
 
             transcript = transcript.trim();
-            console.log(`[Raw Model Output]: "${transcript}"`);
-
             if (!transcript) return;
+
+            recordTelemetryEvent('VOICE_ASR', 'INFERENCE_COMPLETE', {
+              transcript,
+              latencyMs: inferenceMs,
+              mode: currentMode
+            });
 
             if (currentMode === 'NAVIGATION') {
               const lower = transcript.toLowerCase();
@@ -290,9 +322,8 @@ browser.runtime.onConnect.addListener((port) => {
 
               for (const [cmd, config] of Object.entries(COMMANDS)) {
                 if (lower.includes(cmd)) {
-                  console.log(`[Handsfree Command Triggered]: ${cmd}`);
+                  telemetrySession.metrics.recognizedCommands++;
 
-                  // Handle Browser-Level Operations
                   if (config.action === 'NEXT_TAB') {
                     cycleTab(1);
                   } else if (config.action === 'PREV_TAB') {
@@ -301,18 +332,23 @@ browser.runtime.onConnect.addListener((port) => {
                     createNewTab();
                   } else if (config.action === 'CLOSE_TAB') {
                     closeCurrentTab();
+                  } else if (config.action === 'START_CALIBRATION') {
+                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'START_CALIBRATION' });
                   } else if (config.action === 'RECENTER') {
-                    if (cursorTrackingPort) {
-                      cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
-                    }
+                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
+                  } else if (config.action === 'EXPORT_METRICS') {
+                    exportEvaluationCSV();
                   } else {
-                    // Handle Page-Level DOM Operations
                     const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
                     const payload = isCoordCommand
                       ? { x: latestCursor.x, y: latestCursor.y }
                       : config.payload;
 
                     sendToTab({ type: 'COMMAND', command: config.action, payload });
+
+                    if (config.action === 'CLICK' && cursorTrackingPort) {
+                      cursorTrackingPort.postMessage({ type: 'NEXT_CALIB_POINT' });
+                    }
                   }
 
                   matched = true;
@@ -321,7 +357,7 @@ browser.runtime.onConnect.addListener((port) => {
               }
 
               if (!matched) {
-                console.log(`[Handsfree] No navigation command matched in: "${lower}"`);
+                telemetrySession.metrics.unrecognizedUtterances++;
               }
             } else if (currentMode === 'DICTATION') {
               const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
@@ -336,7 +372,6 @@ browser.runtime.onConnect.addListener((port) => {
                 cleanText === 'press enter' ||
                 cleanText === 'press search'
               ) {
-                console.log(`[Handsfree] Intercepted SEARCH / SUBMIT command from: "${transcript}"`);
                 sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
@@ -347,7 +382,6 @@ browser.runtime.onConnect.addListener((port) => {
                 cleanText === 'delete all' ||
                 cleanText.endsWith(' clear')
               ) {
-                console.log(`[Handsfree] Intercepted CLEAR command from utterance: "${transcript}"`);
                 sendToTab({ type: 'COMMAND', command: 'CLEAR' });
               } else {
                 sendToTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
@@ -362,7 +396,6 @@ browser.runtime.onConnect.addListener((port) => {
   }
 });
 
-// Audio math helpers
 function calculateRMS(buffer) {
   let sum = 0;
   for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
@@ -372,9 +405,7 @@ function calculateRMS(buffer) {
 function calculateZCR(buffer) {
   let crossings = 0;
   for (let i = 1; i < buffer.length; i++) {
-    if ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0)) {
-      crossings++;
-    }
+    if ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0)) crossings++;
   }
   return crossings / buffer.length;
 }
@@ -390,10 +421,15 @@ function mergeAudioBuffers(buffers) {
   return result;
 }
 
-// Mode changes triggered by DOM focus in content.js
 browser.runtime.onMessage.addListener((message) => {
   if (message.type === 'SET_MODE') {
     currentMode = message.mode;
-    console.log(`[Handsfree] Switched to mode: ${currentMode}`);
+  } else if (message.type === 'TELEMETRY_LOG') {
+    recordTelemetryEvent(message.category, message.eventName, message.details);
+    if (message.eventName === 'SELECTION_ACTIVATION') {
+      telemetrySession.metrics.totalClicks++;
+      if (message.details?.activationMethod === 'DWELL_CLICK') telemetrySession.metrics.dwellClicks++;
+      if (message.details?.activationMethod === 'VOICE_CLICK') telemetrySession.metrics.voiceClicks++;
+    }
   }
 });
