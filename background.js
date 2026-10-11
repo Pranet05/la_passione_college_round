@@ -71,21 +71,39 @@ const COMMANDS = {
 
 // --- Tab Navigation Handlers ---
 
-// Switches to the next or previous regular web tab
+// --- Reliable Multi-Window Tab Navigation Handlers ---
+
+async function getNormalBrowserTabs() {
+  // 1. Target the last-focused normal browser window
+  let targetWindow = null;
+  try {
+    targetWindow = await browser.windows.getLastFocused({ populate: true, windowTypes: ['normal'] });
+  } catch (e) {
+    targetWindow = await browser.windows.getCurrent({ populate: true });
+  }
+
+  if (!targetWindow || !targetWindow.tabs) return { currentWindow: null, webTabs: [] };
+
+  // 2. Filter out extension utility tabs (tracker, mic permission, devtools)
+  const webTabs = targetWindow.tabs.filter(t => 
+    t.url && !t.url.startsWith('moz-extension://') && !t.url.startsWith('about:debugging')
+  );
+
+  return { currentWindow: targetWindow, webTabs };
+}
+
 async function cycleTab(direction = 1) {
   try {
-    const currentWindow = await browser.windows.getCurrent({ populate: true });
-    if (!currentWindow || !currentWindow.tabs) return;
+    const { currentWindow, webTabs } = await getNormalBrowserTabs();
 
-    // Filter to navigable web tabs, skipping internal extension pages
-    const webTabs = currentWindow.tabs.filter(t => 
-      t.url && (t.url.startsWith('http://') || t.url.startsWith('https://') || t.url.startsWith('about:blank') || t.url.startsWith('about:home'))
-    );
+    if (webTabs.length <= 1) {
+      console.warn('[Handsfree] Not enough web tabs to cycle through.');
+      return;
+    }
 
-    if (webTabs.length <= 1) return;
-
-    const currentTab = currentWindow.tabs.find(t => t.active);
-    const currentIndex = webTabs.findIndex(t => t.id === currentTab?.id);
+    // Identify which tab is currently active in that window
+    const activeTab = currentWindow.tabs.find(t => t.active);
+    const currentIndex = webTabs.findIndex(t => t.id === activeTab?.id);
 
     let nextIndex;
     if (currentIndex === -1) {
@@ -96,7 +114,11 @@ async function cycleTab(direction = 1) {
 
     const targetTab = webTabs[nextIndex];
     if (targetTab?.id) {
+      // 1. Activate tab
       await browser.tabs.update(targetTab.id, { active: true });
+      // 2. Ensure its parent window is brought to the foreground
+      await browser.windows.update(targetTab.windowId, { focused: true });
+
       activeTabId = targetTab.id;
       console.log(`[Handsfree] Switched to tab: ${targetTab.title || targetTab.id}`);
     }
@@ -105,24 +127,35 @@ async function cycleTab(direction = 1) {
   }
 }
 
-// Opens a new blank tab and activates it
 async function createNewTab() {
   try {
-    const tab = await browser.tabs.create({ active: true });
-    activeTabId = tab.id;
+    const { currentWindow } = await getNormalBrowserTabs();
+    const windowId = currentWindow ? currentWindow.id : undefined;
+
+    const newTab = await browser.tabs.create({ 
+      active: true, 
+      windowId: windowId 
+    });
+
+    if (newTab.windowId) {
+      await browser.windows.update(newTab.windowId, { focused: true });
+    }
+
+    activeTabId = newTab.id;
     console.log('[Handsfree] Opened new tab.');
   } catch (err) {
     console.error('[Handsfree] Failed to create tab:', err);
   }
 }
 
-// Closes current active tab (guards against closing the tracker or mic tab)
 async function closeCurrentTab() {
   try {
-    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    const tab = tabs[0];
-    if (tab && !tab.url.startsWith('moz-extension://')) {
-      await browser.tabs.remove(tab.id);
+    const { currentWindow } = await getNormalBrowserTabs();
+    if (!currentWindow || !currentWindow.tabs) return;
+
+    const activeTab = currentWindow.tabs.find(t => t.active);
+    if (activeTab && !activeTab.url.startsWith('moz-extension://')) {
+      await browser.tabs.remove(activeTab.id);
       console.log('[Handsfree] Closed active tab.');
     }
   } catch (err) {
