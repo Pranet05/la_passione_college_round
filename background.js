@@ -11,49 +11,83 @@ let silenceFrames = 0;
 
 // Holds latest normalized nose coordinates streamed from tracker.js
 let latestCursor = { x: 0.5, y: 0.5 };
+let cursorTrackingPort = null;
 
-// Active tab cache to eliminate tabs.query IPC lag
+// Synchronous active tab cache to eliminate IPC roundtrip lag during cursor streaming
 let activeTabId = null;
 
-// VAD parameters tuned for earphone microphones
-const SILENCE_RMS_THRESHOLD = 0.004;
-const MIN_SPEECH_ZCR = 0.04;
-const SILENCE_FRAMES_TO_TRIGGER = 3; // ~0.8s pause triggers inference
+// High-speed VAD parameters: ~250ms pause triggers inference
+const SILENCE_RMS_THRESHOLD = 0.003;
+const MIN_SPEECH_ZCR = 0.02;
+const SILENCE_FRAMES_TO_TRIGGER = 2;
 
 const COMMANDS = {
+  // Navigation scrolling
   'scroll down': { action: 'SCROLL', payload: { y: 600 } },
   'scroll up': { action: 'SCROLL', payload: { y: -600 } },
   'down': { action: 'SCROLL', payload: { y: 350 } },
   'up': { action: 'SCROLL', payload: { y: -350 } },
+  'page down': { action: 'SCROLL', payload: { y: 600 } },
+  'page up': { action: 'SCROLL', payload: { y: -600 } },
+
+  // Click & phonetic Whisper variations
   'click': { action: 'CLICK' },
+  'quick': { action: 'CLICK' },
+  'clique': { action: 'CLICK' },
+  'klick': { action: 'CLICK' },
+  'tap': { action: 'CLICK' },
+  'press': { action: 'CLICK' },
+  'select': { action: 'CLICK' },
+
+  // Sticky Hold & Release (Mouse Down / Drag / Drop)
+  'sticky hold': { action: 'HOLD' },
+  'hold': { action: 'HOLD' },
+  'grab': { action: 'HOLD' },
+  'release': { action: 'RELEASE' },
+  'drop': { action: 'RELEASE' },
+  'unhold': { action: 'RELEASE' },
+
+  // Search input focus
   'focus search': { action: 'FOCUS_SEARCH' },
+  'search': { action: 'FOCUS_SEARCH' },
+  'find': { action: 'FOCUS_SEARCH' },
+
+  // Gaze center recalibration
+  'recenter': { action: 'RECENTER' },
+  'center': { action: 'RECENTER' },
+
+  // Input reset
   'clear': { action: 'CLEAR' }
 };
 
-// 1. Maintain Active Web Tab Cache Safely
+// 1. Maintain Active Web Tab Target Synchronously
 async function updateActiveTab() {
   try {
-    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    let target = tabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
-
-    if (!target) {
-      const allTabs = await browser.tabs.query({ active: true });
-      target = allTabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
-    }
-
+    const focusedTabs = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+    const target = focusedTabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
     if (target?.id) {
       activeTabId = target.id;
+      return;
+    }
+
+    const allTabs = await browser.tabs.query({ active: true });
+    const fallback = allTabs.find(t => t.url && (t.url.startsWith('http://') || t.url.startsWith('https://')));
+    if (fallback?.id) {
+      activeTabId = fallback.id;
     }
   } catch (e) {
-    // Fail silently during browser tab transitions
+    // Fail silently during transitions
   }
 }
 
 browser.tabs.onActivated.addListener(() => { updateActiveTab(); });
 browser.tabs.onUpdated.addListener(() => { updateActiveTab(); });
+if (browser.windows?.onFocusChanged) {
+  browser.windows.onFocusChanged.addListener(() => { updateActiveTab(); });
+}
 updateActiveTab();
 
-// Non-blocking fire-and-forget message dispatcher
+// Synchronous, non-blocking message dispatcher (Zero IPC query lag!)
 function sendToTab(msg) {
   if (activeTabId) {
     browser.tabs.sendMessage(activeTabId, msg).catch(() => {
@@ -61,11 +95,7 @@ function sendToTab(msg) {
       updateActiveTab();
     });
   } else {
-    updateActiveTab().then(() => {
-      if (activeTabId) {
-        browser.tabs.sendMessage(activeTabId, msg).catch(() => {});
-      }
-    });
+    updateActiveTab();
   }
 }
 
@@ -89,6 +119,11 @@ browser.runtime.onConnect.addListener((port) => {
   // --- High-Speed Nose Tracking Stream ---
   if (port.name === 'cursor-tracking') {
     console.log('[Handsfree] Cursor tracking port connected.');
+    cursorTrackingPort = port;
+
+    port.onDisconnect.addListener(() => {
+      if (cursorTrackingPort === port) cursorTrackingPort = null;
+    });
 
     port.onMessage.addListener((msg) => {
       if (msg && msg.type === 'CURSOR_MOVE') {
@@ -104,7 +139,7 @@ browser.runtime.onConnect.addListener((port) => {
     });
   }
 
-  // --- Audio Stream from mic-permission tab ---
+  // --- Audio Stream from unified tracker tab ---
   if (port.name === 'audio-stream') {
     console.log('[Handsfree] Audio stream port connected.');
 
@@ -129,8 +164,8 @@ browser.runtime.onConnect.addListener((port) => {
           audioBufferChunk = [];
           silenceFrames = 0;
 
-          // Drop noise bursts shorter than 0.4 seconds
-          if (fullBuffer.length < 16000 * 0.4) return;
+          // Drop noise bursts shorter than 0.20 seconds
+          if (fullBuffer.length < 16000 * 0.20) return;
 
           console.log(`[Handsfree] Processing utterance (${(fullBuffer.length / 16000).toFixed(1)}s)...`);
 
@@ -154,11 +189,18 @@ browser.runtime.onConnect.addListener((port) => {
                 if (lower.includes(cmd)) {
                   console.log(`[Handsfree Command Triggered]: ${cmd}`);
 
-                  const payload = (cmd === 'click')
-                    ? { x: latestCursor.x, y: latestCursor.y }
-                    : config.payload;
+                  if (config.action === 'RECENTER') {
+                    if (cursorTrackingPort) {
+                      cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
+                    }
+                  } else {
+                    const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
+                    const payload = isCoordCommand
+                      ? { x: latestCursor.x, y: latestCursor.y }
+                      : config.payload;
 
-                  sendToTab({ type: 'COMMAND', command: config.action, payload });
+                    sendToTab({ type: 'COMMAND', command: config.action, payload });
+                  }
                   matched = true;
                   break;
                 }
@@ -180,9 +222,7 @@ browser.runtime.onConnect.addListener((port) => {
                 cleanText.endsWith(' search')
               ) {
                 console.log(`[Handsfree] Intercepted SEARCH / SUBMIT command from: "${transcript}"`);
-                // 1. Submit search form / press Enter
                 sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
-                // 2. Return back to NAVIGATION mode
                 currentMode = 'NAVIGATION';
                 sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
               } else if (

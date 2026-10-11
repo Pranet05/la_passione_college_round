@@ -2,25 +2,54 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Nose Tracker Feed</title>
+  <title>Handsfree Control Hub</title>
   <style>
+    * { box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      margin: 20px;
+      margin: 0;
+      padding: 20px;
       background: #0f172a;
       color: #f8fafc;
       display: flex;
       flex-direction: column;
       align-items: center;
+      min-height: 100vh;
+    }
+    .container {
+      width: 100%;
+      max-width: 520px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h2 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      color: #38bdf8;
+    }
+    .badge {
+      background: #1e293b;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid #334155;
+      color: #94a3b8;
     }
     .viewport {
       position: relative;
-      width: 480px;
-      height: 360px;
-      border-radius: 12px;
+      width: 100%;
+      height: 320px;
+      border-radius: 14px;
       overflow: hidden;
       border: 2px solid #334155;
-      background: #000;
+      background: #020617;
     }
     video {
       width: 100%;
@@ -28,31 +57,286 @@
       object-fit: cover;
       transform: scaleX(-1); /* Mirror camera feed */
     }
+    .crosshair {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 24px;
+      height: 24px;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      border: 1.5px dashed rgba(56, 189, 248, 0.6);
+      border-radius: 50%;
+    }
+    .crosshair::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 2px;
+      right: 2px;
+      height: 1px;
+      background: rgba(56, 189, 248, 0.6);
+    }
+    .crosshair::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      top: 2px;
+      bottom: 2px;
+      width: 1px;
+      background: rgba(56, 189, 248, 0.6);
+    }
     .panel {
-      margin-top: 16px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      width: 480px;
+      gap: 12px;
     }
-    .status {
-      font-weight: 600;
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
       font-size: 14px;
     }
-    .info {
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #eab308;
+    }
+    .dot.green { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+    .dot.red { background: #ef4444; }
+    .btn {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: background 0.15s ease;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary {
+      background: #334155;
+    }
+    .btn-secondary:hover { background: #475569; }
+    .mic-meter-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+    }
+    .meter-bar {
+      flex: 1;
+      height: 8px;
+      background: #0f172a;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid #334155;
+    }
+    .meter-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
+      transition: width 0.08s ease;
+    }
+    .slider-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .slider-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
       font-size: 13px;
       color: #94a3b8;
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: #38bdf8;
+      cursor: pointer;
+    }
+    .toggle-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      border-top: 1px solid #334155;
+      padding-top: 8px;
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+    }
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider-round {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #475569;
+      transition: .2s;
+      border-radius: 24px;
+    }
+    .slider-round:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider-round {
+      background-color: #0284c7;
+    }
+    input:checked + .slider-round:before {
+      transform: translateX(20px);
+    }
+    .commands-card {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px 12px;
+      margin-top: 6px;
+    }
+    .cmd-tag {
+      background: #1e293b;
+      padding: 3px 8px;
+      border-radius: 4px;
+      color: #f1f5f9;
+      font-family: monospace;
     }
   </style>
 </head>
 <body>
-  <h2>Handsfree Nose Gaze Engine</h2>
-  <div class="viewport">
-    <video id="webcam" autoplay playsinline></video>
-  </div>
-  <div class="panel">
-    <div id="status" class="status">Loading MediaPipe Face Landmarker...</div>
-    <div id="metrics" class="info">Coords: (0.50, 0.50) | FPS: 0</div>
+  <div class="container">
+    <header>
+      <h2>Handsfree Control Hub</h2>
+      <span class="badge" id="ipc-status">Connecting...</span>
+    </header>
+
+    <div class="viewport">
+      <video id="webcam" autoplay playsinline></video>
+      <div class="crosshair" title="Calibrated Center"></div>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <div class="status-badge">
+          <div class="dot" id="cam-dot"></div>
+          <span id="status">Starting Camera & WASM...</span>
+        </div>
+        <button class="btn btn-secondary" id="popout-btn" title="Open as separate mini window">🗗 Popout</button>
+      </div>
+
+      <div class="row">
+        <div class="status-badge">
+          <div class="dot" id="mic-dot"></div>
+          <span id="mic-status">Starting Audio Engine...</span>
+        </div>
+        <div id="metrics" style="font-size: 13px; color: #94a3b8;">Coords: (0.50, 0.50)</div>
+      </div>
+
+      <div class="mic-meter-container">
+        <span style="font-size: 12px; color: #94a3b8;">Mic</span>
+        <div class="meter-bar">
+          <div class="meter-fill" id="mic-level"></div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 10px;">
+        <button class="btn" id="recenter-btn" style="flex: 1;">🎯 Recenter Gaze (Space / Say "Center")</button>
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <span>Horizontal Sensitivity</span>
+          <span id="sens-x-val">4.2x</span>
+        </div>
+        <input type="range" id="sens-x" min="1.5" max="7.0" step="0.1" value="4.2">
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <span>Vertical Sensitivity</span>
+          <span id="sens-y-val">4.8x</span>
+        </div>
+        <input type="range" id="sens-y" min="1.5" max="7.0" step="0.1" value="4.8">
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <span>Responsive Smoothing</span>
+          <span id="smooth-val">0.45</span>
+        </div>
+        <input type="range" id="smooth-factor" min="0.20" max="0.80" step="0.05" value="0.45">
+      </div>
+
+      <!-- Sticky Hold Settings -->
+      <div class="toggle-row">
+        <div>
+          <div style="font-weight: 600; font-size: 13px;">🎯 Sticky Hold (Dwell Click)</div>
+          <div style="font-size: 11px; color: #94a3b8;">Hold gaze steady on any button/link to auto-click</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="sticky-hold-toggle" checked>
+          <span class="slider-round"></span>
+        </label>
+      </div>
+
+      <div class="slider-group" id="dwell-time-group">
+        <div class="slider-header">
+          <span>Hold Dwell Time</span>
+          <span id="dwell-val">1.0s</span>
+        </div>
+        <input type="range" id="dwell-time" min="0.6" max="2.2" step="0.1" value="1.0">
+      </div>
+
+      <div class="commands-card">
+        <strong>Voice Commands:</strong>
+        <div class="cmd-grid">
+          <div><span class="cmd-tag">"click"</span> or <span class="cmd-tag">"tap"</span></div>
+          <div><span class="cmd-tag">"hold"</span> (grab / drag)</div>
+          <div><span class="cmd-tag">"release"</span> (drop)</div>
+          <div><span class="cmd-tag">"search"</span> (focus search)</div>
+          <div><span class="cmd-tag">"scroll down"</span> / <span class="cmd-tag">"down"</span></div>
+          <div><span class="cmd-tag">"scroll up"</span> / <span class="cmd-tag">"up"</span></div>
+          <div><span class="cmd-tag">"center"</span> (recalibrate gaze)</div>
+          <div><span class="cmd-tag">"clear"</span> (empty field)</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="tracker.js"></script>
