@@ -101,6 +101,9 @@ let dwellTargetElement = null;
 let dwellAnchorX = 0;
 let dwellAnchorY = 0;
 let dwellCooldownUntil = 0;
+// The element most recently activated by dwell. It is not re-armed until the
+// cursor leaves it, preventing repeated clicks while the user rests in place.
+let lastDwellClickedElement = null;
 let isHoldingDrag = false;
 let holdDragTarget = null;
 
@@ -120,6 +123,11 @@ let linkHintEntries = [];
 let selectedLinkHint = null;
 let linkHintRefreshTimer = null;
 let linkHintOverlayActive = false;
+
+// Elements treated as interactive targets for dwell / voice clicks.
+// tabindex="-1" is excluded: it marks programmatically-focusable containers
+// (often whole page regions), not things a user intends to click.
+const CLICKABLE_SELECTOR = 'a, button, [role="button"], input, select, textarea, [tabindex]:not([tabindex="-1"]), label';
 
 // Track mouse position if physical mouse is used
 document.addEventListener('mousemove', (e) => {
@@ -202,12 +210,41 @@ function scheduleLinkHintRefresh() {
 
 function updateLinkHintOverlay() {
   if (!linkHintOverlayActive) return;
-  const links = getVisibleLinks();
   ensureLinkHintOverlay();
   refreshLinkHints();
 }
 
+// The observer is only connected while the overlay is open so pages are not
+// monitored for DOM changes when link hints are not in use.
+let linkHintObserver = null;
+
+function startLinkHintObserver() {
+  if (typeof MutationObserver === 'undefined') return;
+  if (!linkHintObserver) {
+    linkHintObserver = new MutationObserver((mutations) => {
+      // Rebuilding the overlay changes its own children; do not observe those
+      // changes or the refresh would continuously schedule itself.
+      if (mutations.some(mutation => !linkHintOverlay || !linkHintOverlay.contains(mutation.target))) {
+        scheduleLinkHintRefresh();
+      }
+    });
+  }
+  linkHintObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+}
+
+function stopLinkHintObserver() {
+  if (linkHintObserver) linkHintObserver.disconnect();
+  if (linkHintRefreshTimer) {
+    clearTimeout(linkHintRefreshTimer);
+    linkHintRefreshTimer = null;
+  }
+}
+
 function closeLinkHintOverlay() {
+  stopLinkHintObserver();
   if (linkHintOverlay) {
     linkHintOverlay.remove();
     linkHintOverlay = null;
@@ -220,6 +257,7 @@ function closeLinkHintOverlay() {
 function openLinkHintOverlay() {
   linkHintOverlayActive = true;
   updateLinkHintOverlay();
+  startLinkHintObserver();
 }
 
 function selectLinkHint(number) {
@@ -237,19 +275,6 @@ function selectLinkHint(number) {
 
 window.addEventListener('scroll', scheduleLinkHintRefresh, { passive: true });
 window.addEventListener('resize', scheduleLinkHintRefresh, { passive: true });
-if (typeof MutationObserver !== 'undefined') {
-  const linkHintObserver = new MutationObserver((mutations) => {
-    // Rebuilding the overlay changes its own children; do not observe those
-    // changes or the refresh would continuously schedule itself.
-    if (mutations.some(mutation => !linkHintOverlay || !linkHintOverlay.contains(mutation.target))) {
-      scheduleLinkHintRefresh();
-    }
-  });
-  linkHintObserver.observe(document.documentElement, {
-    childList: true,
-    subtree: true
-  });
-}
 
 // --- 2. Focus Monitoring for Automatic Mode Switching & Highlight Styling ---
 function isTextInput(el) {
@@ -313,7 +338,7 @@ function findScrollableElement(startX, startY) {
 function getClickableAt(x, y) {
   const el = document.elementFromPoint(x, y);
   if (!el || el === document.body || el === document.documentElement) return null;
-  return el.closest('a, button, [role="button"], input, select, textarea, [tabindex], label');
+  return el.closest(CLICKABLE_SELECTOR);
 }
 
 // --- 3. Cursor Loop with Sticky Target Snapping ---
@@ -354,7 +379,13 @@ function updateCursorRender() {
 function checkStickyDwellHold(clickable) {
   const now = performance.now();
 
-  if (!stickyHoldEnabled || isHoldingDrag || now < dwellCooldownUntil) {
+  // Re-arm dwell only once the cursor has left the last dwell-clicked element
+  if (lastDwellClickedElement && clickable !== lastDwellClickedElement) {
+    lastDwellClickedElement = null;
+  }
+
+  if (!stickyHoldEnabled || isHoldingDrag || now < dwellCooldownUntil ||
+      (clickable && clickable === lastDwellClickedElement)) {
     resetDwellRing();
     return;
   }
@@ -373,6 +404,7 @@ function checkStickyDwellHold(clickable) {
 
       if (progress >= 1.0) {
         triggerClick(currentScreenX, currentScreenY, clickable, 'DWELL_CLICK');
+        lastDwellClickedElement = clickable;
         dwellCooldownUntil = now + 900;
         resetDwellRing();
 
@@ -703,11 +735,15 @@ function handleNavigationCommand(command, payload) {
       }
 
       if (!targetInput) {
+        const retryCount = payload?.searchRetry || 0;
         const triggerBtn = document.querySelector('button[aria-label*="search" i], [role="button"][aria-label*="search" i]');
-        if (triggerBtn) {
-          triggerBtn.click();
+        // Some sites reveal the search box only after a button is pressed. Retry a
+        // bounded number of times so a button that never reveals an input does
+        // not cause an endless click loop.
+        if (triggerBtn && retryCount < 3) {
+          if (retryCount === 0) triggerBtn.click();
           setTimeout(() => {
-            handleNavigationCommand('FOCUS_SEARCH', payload);
+            handleNavigationCommand('FOCUS_SEARCH', { ...payload, searchRetry: retryCount + 1 });
           }, 150);
           return;
         }
@@ -795,7 +831,7 @@ function triggerClick(clickX, clickY, knownTarget = null, activationMethod = 'VO
 
   if (!target) return;
 
-  const clickable = target.closest('a, button, [role="button"], input, select, textarea, [tabindex], label') || target;
+  const clickable = target.closest(CLICKABLE_SELECTOR) || target;
   const isInteractive = Boolean(clickable && clickable !== document.body && clickable !== document.documentElement);
   const acquisitionTimeMs = Math.round(performance.now() - lastTargetHoverTime);
 
@@ -843,15 +879,32 @@ function triggerClick(clickX, clickY, knownTarget = null, activationMethod = 'VO
     target.dispatchEvent(createEvent(evtType));
   });
 
-  if (typeof clickable.click === 'function') {
+  const isAnchor = clickable.tagName === 'A';
+  let defaultPrevented = false;
+
+  if (isAnchor) {
+    // dispatchEvent returns false when a page handler (e.g. an SPA router)
+    // called preventDefault(); we need that to decide on the fallback below.
+    defaultPrevented = !clickable.dispatchEvent(createEvent('click'));
+  } else if (typeof clickable.click === 'function') {
     clickable.click();
   } else {
     target.dispatchEvent(createEvent('click'));
   }
 
-  if (clickable.tagName === 'A' && clickable.href && !clickable.href.startsWith('javascript:')) {
+  // Fallback for pages where the synthetic click did not navigate. Only applies
+  // to plain same-tab http(s) links the page did not handle itself.
+  const linkTarget = (clickable.getAttribute?.('target') || '').toLowerCase();
+  if (
+    isAnchor &&
+    !defaultPrevented &&
+    /^https?:/i.test(clickable.href || '') &&
+    !clickable.hasAttribute('download') &&
+    (linkTarget === '' || linkTarget === '_self')
+  ) {
+    const hrefBeforeClick = window.location.href;
     setTimeout(() => {
-      if (window.location.href !== clickable.href && !clickable.href.startsWith('#')) {
+      if (window.location.href === hrefBeforeClick && clickable.href !== hrefBeforeClick) {
         window.location.href = clickable.href;
       }
     }, 120);

@@ -6,16 +6,23 @@ env.useBrowserCache = true;
 let transcriber = null;
 let currentMode = 'NAVIGATION';
 let audioBufferChunk = [];
+let audioBufferedSamples = 0;
 let silenceFrames = 0;
+let isInferring = false;
+const utteranceQueue = [];
 
 let latestCursor = { x: 0.5, y: 0.5 };
 let cursorTrackingPort = null;
 let activeTabId = null;
 
 // High-speed VAD parameters: ~250-300ms pause triggers inference
+const SAMPLE_RATE = 16000;
 const SILENCE_RMS_THRESHOLD = 0.003;
 const MIN_SPEECH_ZCR = 0.02;
 const SILENCE_FRAMES_TO_TRIGGER = 2;
+const MAX_UTTERANCE_SAMPLES = SAMPLE_RATE * 8; // force inference after 8s of audio
+const MAX_QUEUED_UTTERANCES = 3;
+const MAX_TELEMETRY_LOGS = 5000;
 
 // --- Performance Evaluation Telemetry Engine ---
 const telemetrySession = {
@@ -35,18 +42,24 @@ const telemetrySession = {
 
 function recordTelemetryEvent(category, eventName, details = {}) {
   const entry = {
+    ...(details && typeof details === 'object' ? details : {}),
+    // Core fields are applied last so caller-supplied details cannot overwrite them
     timestamp: new Date().toISOString(),
     sessionElapsedMs: Math.round(performance.now() - telemetrySession.startTime),
     category,
-    eventName,
-    ...details
+    eventName
   };
   telemetrySession.logs.push(entry);
+  if (telemetrySession.logs.length > MAX_TELEMETRY_LOGS) {
+    telemetrySession.logs.splice(0, telemetrySession.logs.length - MAX_TELEMETRY_LOGS);
+  }
 }
 
 // Helpers for human-friendly formatting in Excel
 function escapeCsv(value) {
-  const text = typeof value === 'string' ? value : String(value ?? '');
+  let text = typeof value === 'string' ? value : String(value ?? '');
+  // Neutralise spreadsheet formula injection (e.g. a transcript starting with "=")
+  if (/^[=+@\t\r]|^-(?![-\s]|$)/.test(text)) text = `'${text}`;
   return `"${text.replace(/"/g, '""')}"`;
 }
 
@@ -269,6 +282,11 @@ function exportEvaluationCSV() {
     url,
     filename: `handsfree_evaluation_${Date.now()}.csv`,
     saveAs: true
+  }).catch((err) => {
+    console.error('[Handsfree] CSV export failed:', err);
+  }).finally(() => {
+    // Give the download manager time to read the blob before releasing it
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   });
 }
 
@@ -303,7 +321,7 @@ const COMMANDS = {
   'stop reading': { action: 'AUTO_SCROLL_STOP' },
   'stop': { action: 'AUTO_SCROLL_STOP' },
 
-  // 6. Adjust Speed (Step size 0.25)
+  // 6. Adjust Speed (Step size 0.75)
   'move fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
   'fast': { action: 'AUTO_SCROLL_SPEED', payload: { delta: 0.75 } },
   'move slow': { action: 'AUTO_SCROLL_SPEED', payload: { delta: -0.75 } },
@@ -329,11 +347,61 @@ const COMMANDS = {
 
   // 12. Evaluation & Telemetry Export
   'export stats': { action: 'EXPORT_METRICS' },
-  'export metrics': { action: 'EXPORT_METRICS' }
+  'export metrics': { action: 'EXPORT_METRICS' },
+
+  // 13. Numbered Link Hint Overlay
+  'open multi link overlay': { action: 'OPEN_LINK_OVERLAY' },
+  'show links': { action: 'OPEN_LINK_OVERLAY' },
+
+  // 14. 5-Point Calibration Wizard
+  'calibrate': { action: 'START_CALIBRATION' }
 };
 
-// Sort longest phrase first so multi-word commands take priority over standalone keywords
-const SORTED_COMMAND_KEYS = Object.keys(COMMANDS).sort((a, b) => b.length - a.length);
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Sort longest phrase first so multi-word commands take priority over standalone keywords.
+// Regexes are compiled once and require whole-word matches so that e.g. "update"
+// does not trigger "up" and "download" does not trigger "down".
+const SORTED_COMMANDS = Object.keys(COMMANDS)
+  .sort((a, b) => b.length - a.length)
+  .map(key => ({ key, regex: new RegExp(`(^|\\s)${escapeRegex(key)}(\\s|$)`) }));
+
+const NUMBER_UNITS = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19
+};
+const NUMBER_TENS = {
+  twenty: 20, thirty: 30, forty: 40, fifty: 50,
+  sixty: 60, seventy: 70, eighty: 80, ninety: 90
+};
+
+function parseNumberWords(words) {
+  if (words.length === 0 || words.length > 2) return null;
+  const [first, second] = words;
+  if (/^\d{1,3}$/.test(first) && words.length === 1) return Number(first);
+  if (NUMBER_TENS[first] !== undefined) {
+    if (second === undefined) return NUMBER_TENS[first];
+    const unit = NUMBER_UNITS[second];
+    return unit !== undefined && unit > 0 && unit < 10 ? NUMBER_TENS[first] + unit : null;
+  }
+  if (NUMBER_UNITS[first] !== undefined && second === undefined) return NUMBER_UNITS[first];
+  return null;
+}
+
+// Resolves a link-hint number from an utterance. Only accepts utterances that are
+// a number on its own, optionally prefixed by a selector word ("link 4",
+// "click three", "twenty one"), so ordinary phrases like "next one" are ignored.
+function parseLinkNumber(utterance) {
+  const words = utterance.replace(/-/g, ' ').split(/\s+/).filter(Boolean);
+  if (words.length === 0) return null;
+  const prefixes = ['link', 'number', 'hint', 'click', 'select', 'open'];
+  const rest = prefixes.includes(words[0]) ? words.slice(1) : words;
+  return parseNumberWords(rest);
+}
 
 // --- Tab Management Handlers ---
 async function getNormalBrowserTabs() {
@@ -489,10 +557,12 @@ browser.runtime.onConnect.addListener((port) => {
   }
 
   if (port.name === 'audio-stream') {
-    port.onMessage.addListener(async (msg) => {
-      if (!msg.audioChunk || !transcriber) return;
+    port.onMessage.addListener((msg) => {
+      if (!msg || !msg.audioChunk || !transcriber) return;
 
-      const chunk = new Float32Array(msg.audioChunk);
+      const chunk = msg.audioChunk instanceof Float32Array
+        ? msg.audioChunk
+        : new Float32Array(msg.audioChunk);
       const rms = calculateRMS(chunk);
       const zcr = calculateZCR(chunk);
 
@@ -500,141 +570,176 @@ browser.runtime.onConnect.addListener((port) => {
 
       if (isSpeech) {
         audioBufferChunk.push(chunk);
+        audioBufferedSamples += chunk.length;
         silenceFrames = 0;
+        // Continuous noise above the VAD threshold would otherwise grow the
+        // buffer forever without ever triggering inference.
+        if (audioBufferedSamples >= MAX_UTTERANCE_SAMPLES) finalizeUtterance();
       } else if (audioBufferChunk.length > 0) {
         silenceFrames++;
         audioBufferChunk.push(chunk);
+        audioBufferedSamples += chunk.length;
 
-        if (silenceFrames >= SILENCE_FRAMES_TO_TRIGGER) {
-          const fullBuffer = mergeAudioBuffers(audioBufferChunk);
-          audioBufferChunk = [];
-          silenceFrames = 0;
-
-          if (fullBuffer.length < 16000 * 0.35) return;
-
-          try {
-            telemetrySession.metrics.totalVoiceCommands++;
-            const t0 = performance.now();
-            const output = await transcriber(fullBuffer);
-            const inferenceMs = Math.round(performance.now() - t0);
-
-            let transcript = '';
-            if (typeof output === 'string') transcript = output;
-            else if (Array.isArray(output) && output[0]?.text) transcript = output[0].text;
-            else if (output?.text) transcript = output.text;
-
-            transcript = transcript.trim();
-            if (!transcript) return;
-
-            recordTelemetryEvent('VOICE_ASR', 'INFERENCE_COMPLETE', {
-              transcript,
-              latencyMs: inferenceMs,
-              mode: currentMode
-            });
-
-            // 1. Navigation Mode Command Resolution
-            if (currentMode === 'NAVIGATION') {
-              // Strip all punctuation and normalize multiple spaces to a single space
-              const lower = transcript
-                .toLowerCase()
-                .replace(/[.,/#!$%^&*;:{}=\-_`~()?]/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-              console.log(`[Handsfree Cleaned Utterance]: "${lower}"`);
-              const lower = transcript.toLowerCase();
-              const linkNumber = parseLinkNumber(lower);
-
-              // Link hints are handled before the normal command table so
-              // utterances such as "click three" can still select hint 3.
-              if (linkNumber !== null) {
-                console.log(`[Handsfree] Link hint selected: ${linkNumber}`);
-                sendToTab({
-                  type: 'COMMAND',
-                  command: 'LINK_NUMBER',
-                  payload: { number: linkNumber }
-                });
-                return;
-              }
-
-              let matched = false;
-
-              for (const cmd of SORTED_COMMAND_KEYS) {
-                // Check both boundary-isolated match and substring inclusion
-                const regex = new RegExp(`(^|\\s)${cmd}(\\s|$)`, 'i');
-                if (regex.test(lower) || lower.includes(cmd)) {
-                  const config = COMMANDS[cmd];
-                  console.log(`[Handsfree Command Triggered]: "${cmd}"`);
-                  telemetrySession.metrics.recognizedCommands++;
-
-                  if (config.action === 'NEXT_TAB') {
-                    cycleTab(1);
-                  } else if (config.action === 'PREV_TAB') {
-                    cycleTab(-1);
-                  } else if (config.action === 'NEW_TAB') {
-                    createNewTab();
-                  } else if (config.action === 'CLOSE_TAB') {
-                    closeCurrentTab();
-                  } else if (config.action === 'START_CALIBRATION') {
-                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'START_CALIBRATION' });
-                  } else if (config.action === 'RECENTER') {
-                    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
-                  } else if (config.action === 'EXPORT_METRICS') {
-                    exportEvaluationCSV();
-                  } else {
-                    const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
-                    const payload = isCoordCommand
-                      ? { x: latestCursor.x, y: latestCursor.y }
-                      : config.payload;
-
-                    sendToTab({ type: 'COMMAND', command: config.action, payload });
-
-                    if (config.action === 'CLICK' && cursorTrackingPort) {
-                      cursorTrackingPort.postMessage({ type: 'NEXT_CALIB_POINT' });
-                    }
-                  }
-
-                  matched = true;
-                  break;
-                }
-              }
-
-              if (!matched) {
-                telemetrySession.metrics.unrecognizedUtterances++;
-                console.log(`[Handsfree] No command matched in: "${lower}"`);
-              }
-            } else if (currentMode === 'DICTATION') {
-              const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').trim();
-
-              if (cleanText === 'stop dictating' || cleanText === 'exit input' || cleanText === 'escape') {
-                currentMode = 'NAVIGATION';
-                sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
-              } else if (
-                cleanText === 'enter' ||
-                cleanText === 'submit' ||
-                cleanText === 'press enter'
-              ) {
-                sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
-                currentMode = 'NAVIGATION';
-                sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
-              } else if (
-                cleanText === 'clear' ||
-                cleanText === 'clear all' ||
-                cleanText === 'erase'
-              ) {
-                sendToTab({ type: 'COMMAND', command: 'CLEAR' });
-              } else {
-                sendToTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
-              }
-            }
-          } catch (err) {
-            console.error('[Handsfree] Inference error:', err);
-          }
-        }
+        if (silenceFrames >= SILENCE_FRAMES_TO_TRIGGER) finalizeUtterance();
       }
     });
   }
 });
+
+function finalizeUtterance() {
+  const fullBuffer = mergeAudioBuffers(audioBufferChunk);
+  audioBufferChunk = [];
+  audioBufferedSamples = 0;
+  silenceFrames = 0;
+
+  if (fullBuffer.length < SAMPLE_RATE * 0.35) return;
+
+  if (utteranceQueue.length >= MAX_QUEUED_UTTERANCES) {
+    console.warn('[Handsfree] Inference backlog full; dropping oldest utterance.');
+    utteranceQueue.shift();
+  }
+  utteranceQueue.push(fullBuffer);
+  processUtteranceQueue();
+}
+
+// Utterances are transcribed strictly one at a time so commands execute in the
+// order they were spoken and never race each other.
+async function processUtteranceQueue() {
+  if (isInferring) return;
+  isInferring = true;
+  try {
+    while (utteranceQueue.length > 0) {
+      await transcribeAndDispatch(utteranceQueue.shift());
+    }
+  } finally {
+    isInferring = false;
+  }
+}
+
+async function transcribeAndDispatch(fullBuffer) {
+  // Capture the mode before awaiting so a focus change during inference does
+  // not reinterpret this utterance under a different mode.
+  const mode = currentMode;
+
+  try {
+    telemetrySession.metrics.totalVoiceCommands++;
+    const t0 = performance.now();
+    const output = await transcriber(fullBuffer);
+    const inferenceMs = Math.round(performance.now() - t0);
+
+    let transcript = '';
+    if (typeof output === 'string') transcript = output;
+    else if (Array.isArray(output) && output[0]?.text) transcript = output[0].text;
+    else if (output?.text) transcript = output.text;
+
+    transcript = transcript.trim();
+    if (!transcript) return;
+
+    recordTelemetryEvent('VOICE_ASR', 'INFERENCE_COMPLETE', {
+      transcript,
+      latencyMs: inferenceMs,
+      mode
+    });
+
+    if (mode === 'NAVIGATION') {
+      handleNavigationUtterance(transcript);
+    } else if (mode === 'DICTATION') {
+      handleDictationUtterance(transcript);
+    }
+  } catch (err) {
+    console.error('[Handsfree] Inference error:', err);
+  }
+}
+
+// 1. Navigation Mode Command Resolution
+function handleNavigationUtterance(transcript) {
+  // Strip all punctuation and normalize multiple spaces to a single space
+  const lower = transcript
+    .toLowerCase()
+    .replace(/[.,/#!$%^&*;:{}=\-_`~()?'"]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  console.log(`[Handsfree Cleaned Utterance]: "${lower}"`);
+  const linkNumber = parseLinkNumber(lower);
+
+  // Link hints are handled before the normal command table so
+  // utterances such as "click three" can still select hint 3.
+  if (linkNumber !== null) {
+    console.log(`[Handsfree] Link hint selected: ${linkNumber}`);
+    telemetrySession.metrics.recognizedCommands++;
+    sendToTab({
+      type: 'COMMAND',
+      command: 'LINK_NUMBER',
+      payload: { number: linkNumber }
+    });
+    return;
+  }
+
+  const match = SORTED_COMMANDS.find(({ regex }) => regex.test(lower));
+  if (!match) {
+    telemetrySession.metrics.unrecognizedUtterances++;
+    console.log(`[Handsfree] No command matched in: "${lower}"`);
+    return;
+  }
+
+  const config = COMMANDS[match.key];
+  console.log(`[Handsfree Command Triggered]: "${match.key}"`);
+  telemetrySession.metrics.recognizedCommands++;
+
+  if (config.action === 'NEXT_TAB') {
+    cycleTab(1);
+  } else if (config.action === 'PREV_TAB') {
+    cycleTab(-1);
+  } else if (config.action === 'NEW_TAB') {
+    createNewTab();
+  } else if (config.action === 'CLOSE_TAB') {
+    closeCurrentTab();
+  } else if (config.action === 'START_CALIBRATION') {
+    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'START_CALIBRATION' });
+  } else if (config.action === 'RECENTER') {
+    if (cursorTrackingPort) cursorTrackingPort.postMessage({ type: 'CALIBRATE' });
+  } else if (config.action === 'EXPORT_METRICS') {
+    exportEvaluationCSV();
+  } else {
+    const isCoordCommand = ['CLICK', 'HOLD', 'RELEASE'].includes(config.action);
+    const payload = isCoordCommand
+      ? { x: latestCursor.x, y: latestCursor.y }
+      : config.payload;
+
+    sendToTab({ type: 'COMMAND', command: config.action, payload });
+
+    if (config.action === 'CLICK' && cursorTrackingPort) {
+      cursorTrackingPort.postMessage({ type: 'NEXT_CALIB_POINT' });
+    }
+  }
+}
+
+// 2. Dictation Mode
+function handleDictationUtterance(transcript) {
+  const cleanText = transcript.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()?'"]/g, '').trim();
+
+  if (cleanText === 'stop dictating' || cleanText === 'exit input' || cleanText === 'escape') {
+    currentMode = 'NAVIGATION';
+    sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
+  } else if (
+    cleanText === 'enter' ||
+    cleanText === 'submit' ||
+    cleanText === 'press enter'
+  ) {
+    sendToTab({ type: 'COMMAND', command: 'SUBMIT_SEARCH' });
+    currentMode = 'NAVIGATION';
+    sendToTab({ type: 'MODE_CHANGE', mode: 'NAVIGATION' });
+  } else if (
+    cleanText === 'clear' ||
+    cleanText === 'clear all' ||
+    cleanText === 'erase'
+  ) {
+    sendToTab({ type: 'COMMAND', command: 'CLEAR' });
+  } else {
+    sendToTab({ type: 'INJECT_TEXT', text: transcript + ' ' });
+  }
+}
 
 function calculateRMS(buffer) {
   let sum = 0;

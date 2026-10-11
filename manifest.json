@@ -5,7 +5,6 @@
   "description": "Hands-free browser interaction combining local Whisper speech recognition and webcam nose tracking.",
   "permissions": [
     "tabs",
-    "activeTab",
     "downloads"
   ],
   "host_permissions": [
@@ -30,18 +29,6 @@
       "matches": ["<all_urls>"],
       "js": ["content/content.js"],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "vendor/*",
-        "vendor/wasm/*",
-        "vendor/face_landmarker.task",
-        "tracker/*",
-        "tracker/worker.js"
-      ],
-      "matches": ["<all_urls>"]
     }
   ]
 }

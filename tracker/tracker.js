@@ -372,23 +372,18 @@ function startProcessingLoop() {
           let targetX, targetY;
 
           if (calibBounds.calibrated) {
+            // Map the calibrated head-movement range onto the full screen
             const spanX = (calibBounds.maxX - calibBounds.minX) || 0.25;
             const spanY = (calibBounds.maxY - calibBounds.minY) || 0.25;
-            targetX = (rawX - calibBounds.minX) / spanX;
-            targetY = (rawY - calibBounds.minY) / spanY;
+            targetX = (filteredNoseX - calibBounds.minX) / spanX;
+            targetY = (filteredNoseY - calibBounds.minY) / spanY;
           } else {
+            // Project around calibrated neutral head posture
             const originX = calibratedOriginX ?? 0.5;
             const originY = calibratedOriginY ?? 0.5;
-            targetX = 0.5 + (rawX - originX) * sensitivityX;
-            targetY = 0.5 + (rawY - originY) * sensitivityY;
+            targetX = 0.5 + (filteredNoseX - originX) * sensitivityX;
+            targetY = 0.5 + (filteredNoseY - originY) * sensitivityY;
           }
-
-          const originX = calibratedOriginX ?? 0.5;
-          const originY = calibratedOriginY ?? 0.5;
-
-          // Project around calibrated neutral head posture
-          let targetX = 0.5 + (filteredNoseX - originX) * sensitivityX;
-          let targetY = 0.5 + (filteredNoseY - originY) * sensitivityY;
 
           // Suppress sub-pixel camera wobble before it reaches the cursor.
           if (Math.abs(targetX - smoothX) < CURSOR_DEAD_ZONE) targetX = smoothX;
@@ -416,7 +411,7 @@ function startProcessingLoop() {
             });
 
             if (metricsEl) {
-              metricsEl.innerText = `Nose: (${clampedX.toFixed(2)}, ${clampedY.toFixed(2)}) \vert{} Calibrated:${calibBounds.calibrated}`;
+              metricsEl.innerText = `Nose: (${clampedX.toFixed(2)}, ${clampedY.toFixed(2)}) | Calibrated: ${calibBounds.calibrated}`;
             }
           }
         }
